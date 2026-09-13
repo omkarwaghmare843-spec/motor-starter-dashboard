@@ -46,7 +46,7 @@
 
 // LoRa SX1278 (hardware SPI: default ESP32 VSPI = SCK18, MISO19, MOSI23)
 #define LORA_NSS_PIN      5
-#define LORA_RST_PIN      27
+#define LORA_RST_PIN      4
 #define LORA_DIO0_PIN     -1     // not wired on this board -> polling only
 #define LORA_FREQUENCY    433E6  // must match the transmitter's frequency
 
