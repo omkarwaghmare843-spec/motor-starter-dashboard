@@ -17,20 +17,18 @@
     standard SPI-based LoRa library cannot use GPIO16 as SCK.
 
     This firmware instead assumes the LoRa module's SPI lines are wired to
-    the ESP8266's actual hardware HSPI pins, with CS moved to GPIO16 (a
-    plain GPIO toggle, not true hardware chip-select, which is how the LoRa
-    library treats CS anyway) and LoRa RESET moved to GPIO2 (freed up once
-    CS moved off it):
+    the ESP8266's actual hardware HSPI pins, with CS and RESET on plain
+    GPIO toggles (the LoRa library treats both as manual GPIOs anyway, not
+    true hardware signals) confirmed working on the actual board as:
 
         LoRa SCK   -> GPIO14  (fixed HSPI SCK,  was GPIO16 on schematic)
         LoRa MISO  -> GPIO12  (fixed HSPI MISO, matches schematic)
         LoRa MOSI  -> GPIO13  (fixed HSPI MOSI, was GPIO12 on schematic)
-        LoRa CS    -> GPIO16  (was GPIO2 on schematic)
-        LoRa RESET -> GPIO2   (was GPIO13 on schematic)
+        LoRa CS    -> GPIO2   (was GPIO2 on schematic)
+        LoRa RESET -> GPIO16  (was GPIO13 on schematic)
 
-    ==> The physical board wiring needs to be corrected to match the table
-        above before this firmware will work — this is a rewiring note, not
-        just a firmware-side fix.
+    Verified working over the air against motor_starter_rx — if you're
+    building a new board from scratch, wire it to match the table above.
 
   Libraries required (Arduino Library Manager):
     - LoRa (Sandeep Mistry)
@@ -46,8 +44,8 @@
 #define START_BUTTON_PIN  5    // GPIO5, INPUT_PULLUP, active LOW
 #define STOP_BUTTON_PIN   4    // GPIO4, INPUT_PULLUP, active LOW
 
-#define LORA_NSS_PIN      16   // CS   (moved from GPIO2 on schematic)
-#define LORA_RST_PIN      2    // RESET (moved from GPIO13 on schematic)
+#define LORA_NSS_PIN      2    // CS
+#define LORA_RST_PIN      16   // RESET
 #define LORA_DIO0_PIN     -1   // not used on TX side (no receive needed)
 #define LORA_FREQUENCY    433E6   // must match the RX unit's frequency
 

@@ -2,16 +2,12 @@
 
 ## motor_starter_rx/
 
-The main receiver firmware — currently **LoRa + DOL starter control only**.
-GSM/Firebase sync is deliberately left out of this build: the SIM900A module
-is not working on the current board, so that integration is on hold and will
-be added back as a separate step once it's sorted out (see
-`sim900a_https_test/` below for the still-open HTTPS question on that front).
+The main receiver firmware — LoRa + DOL starter control + GSM/ThingSpeak sync.
 
 What it does:
 - Listens for LoRa packets (polled via `LoRa.parsePacket()` — no DIO0
-  interrupt line is wired on this board, per the schematic, so it can't use
-  an interrupt-driven receive).
+  interrupt line is wired on this board, so it can't use an
+  interrupt-driven receive).
 - Validates a `MSTR:` prefix on the payload before acting on it, to reject
   stray packets from other 433MHz devices sharing the band — a real safety
   consideration since this controls a physical motor starter. Recognized
@@ -23,71 +19,102 @@ What it does:
   hold either relay energized continuously.
 - Applies a cooldown (`COMMAND_COOLDOWN_MS`) so a burst of repeated/duplicate
   LoRa packets can't rapid-fire the relays.
-- Reads the voltage sense line and logs it over USB serial every 5s (no
-  cloud reporting yet, by design — see above).
+- Polls ThingSpeak over the SIM900A GSM/GPRS module (`SYNC_INTERVAL_MS`,
+  default 30s) for dashboard commands, applies them, and reports state back.
+  See "Why ThingSpeak, not Firebase" below.
+- A LoRa-triggered start/stop also pushes an immediate ThingSpeak state
+  update (when GPRS is up), so the dashboard reflects a remote-triggered
+  start/stop without waiting for the next poll cycle.
+- Reads the voltage sense line and logs it over USB serial every 5s.
 
-### Pin mapping — confirm before flashing
+### Why ThingSpeak, not Firebase
 
-The schematic's exact GPIO numbers weren't reliably extractable from the
-PDF text layer, so the `#define`s at the top of `motor_starter_rx.ino` use
-sensible ESP32 defaults (avoiding strapping pins 0/2/15 and input-only pins
-34-39 for outputs). **Check these against your actual board before flashing**:
+Firebase's REST API requires TLS 1.2+/SNI, which SIM900A's SSL stack cannot
+reliably complete — confirmed by testing (`sim900a_https_test/`, below) and
+by trying to build the original Firebase-based firmware. Even where HTTPS
+worked, Firebase also needs a real `PUT` to overwrite a fixed path, and
+SIM900A's `AT+HTTPACTION` only supports GET/POST/HEAD — Firebase's REST API
+does not honor an `X-HTTP-Method-Override` workaround either, so that's a
+dead end regardless of the TLS question.
+
+ThingSpeak's classic write API (plain HTTP GET, e.g.
+`http://api.thingspeak.com/update?api_key=...&field1=...`) was verified live
+to still work over plain, unencrypted HTTP — exactly what SIM900A's
+`AT+HTTPACTION=0` can do. The dashboard (`src/thingspeak.js`) and this
+firmware both talk to the same two ThingSpeak channels:
+
+```
+Channel A — device state (this firmware writes, dashboard reads)
+  field1 = motorStatus   (0=OFF, 1=ON)
+  field2 = voltage
+  field3 = gsmSignal
+  field4 = lastSeen       (device uptime seconds — no RTC/NTP on this board)
+
+Channel B — commands (dashboard writes, this firmware reads + acks)
+  field1 = desiredState   (0=OFF, 1=ON)
+  field2 = issuedAt       (unix seconds, from the browser's clock)
+  field3 = ack            (0=pending, 1=applied by device)
+```
+
+Two channels (rather than one shared channel) so device-write and
+dashboard-write traffic don't compete for ThingSpeak's free-tier rate limit
+of roughly one write per 15 seconds per channel.
+
+### Pin mapping (confirmed working on the actual board)
 
 ```
 LORA_NSS_PIN        5
-LORA_RST_PIN        27
-START_RELAY_PIN     25
-STOP_RELAY_PIN      26
+LORA_RST_PIN        4
+START_RELAY_PIN     2
+STOP_RELAY_PIN      15
+RELAY_ACTIVE_HIGH   false
 VOLTAGE_SENSOR_PIN  34
+GSM_RX_PIN          16
+GSM_TX_PIN          17
 ```
 
-LoRa SCK/MISO/MOSI use the ESP32's default hardware SPI pins (18/19/23) via
-the `LoRa` library's defaults — only override these if your board doesn't
-use the default VSPI pins.
+LoRa SCK/MISO/MOSI use the ESP32's default hardware SPI pins (18/19/23).
+
+### ThingSpeak / GSM config
+
+Set `APN` (and `APN_USER`/`APN_PASS` if your SIM needs them) and the four
+ThingSpeak keys/channel IDs near the top of `motor_starter_rx.ino` — this
+firmware needs the state channel's **write** key and the command channel's
+**read + write** keys (the dashboard needs the mirror image: state read key,
+command read + write keys — see the main `README.md`).
 
 ### LoRa protocol
 
 Plain text payloads: `MSTR:START` / `MSTR:STOP`. Implemented identically on
 both sides — see `motor_starter_tx/` below.
 
-### What's deliberately NOT in this build
-
-- No GSM/SIM900A code — on hold.
-- No Firebase reporting — the dashboard won't reflect LoRa-triggered
-  start/stop until GSM sync is added back in.
-- No debounce/anti-repeat on the TX button side needed here — the
-  transmitter (`motor_starter_tx/`) already debounces at the button level,
-  so this RX firmware only needs its own command-level cooldown
-  (`COMMAND_COOLDOWN_MS`) as a second line of defense.
-
 ## motor_starter_tx/
 
 The remote transmitter firmware (ESP8266) — reads the start/stop buttons and
-sends `MSTR:START` / `MSTR:STOP` over LoRa to the RX unit.
+sends `MSTR:START` / `MSTR:STOP` over LoRa to the RX unit. Tested working
+over the air against `motor_starter_rx`.
 
-### Pin mapping — requires a board rewire, not just a firmware setting
+### Pin mapping (confirmed working)
 
-The schematic wires LoRa CLK to GPIO16. **This can't work as drawn**: GPIO16
-is not one of the ESP8266's hardware SPI pins (only GPIO12/13/14 are — this
-is fixed in silicon, unlike the ESP32 where SPI pins are software-selectable),
-so the SPI-based LoRa library cannot use it for SCK.
+The schematic originally wired LoRa CLK to GPIO16, which isn't one of the
+ESP8266's hardware SPI pins (only GPIO12/13/14 are — fixed in silicon,
+unlike the ESP32 where SPI pins are software-selectable), so the SPI-based
+LoRa library couldn't use it for SCK. The board's SPI lines were corrected
+to the actual hardware HSPI pins:
 
-The firmware instead targets this corrected mapping — **the physical LoRa
-module wiring needs to move to match it**:
-
-| Signal     | Firmware pin | Schematic originally had |
-|------------|-------------|---------------------------|
-| LoRa SCK   | GPIO14 (fixed HSPI SCK) | GPIO16 |
-| LoRa MISO  | GPIO12 (fixed HSPI MISO) | GPIO14 |
-| LoRa MOSI  | GPIO13 (fixed HSPI MOSI) | GPIO12 |
-| LoRa CS    | GPIO16 | GPIO2 |
-| LoRa RESET | GPIO2 | GPIO13 |
-| Start button | GPIO5 | GPIO5 (unchanged) |
-| Stop button  | GPIO4 | GPIO4 (unchanged) |
+```
+LoRa SCK    GPIO14  (fixed HSPI SCK)
+LoRa MISO   GPIO12  (fixed HSPI MISO)
+LoRa MOSI   GPIO13  (fixed HSPI MOSI)
+LoRa CS     GPIO2
+LoRa RESET  GPIO16
+Start button GPIO5
+Stop button  GPIO4
+```
 
 CS and RESET are plain GPIO toggles either way (the LoRa library doesn't use
-real hardware chip-select), so moving those two is free — only SCK/MISO/MOSI
-are hardware-constrained.
+real hardware chip-select), so those two are free to place anywhere;
+SCK/MISO/MOSI are the hardware-constrained ones.
 
 ### Behavior
 
@@ -101,47 +128,16 @@ are hardware-constrained.
 
 ## sim900a_https_test/
 
-A one-shot diagnostic sketch — **flash this first, before any real firmware.**
+A one-shot diagnostic sketch that answered the question of whether this
+SIM900A module can complete a real HTTPS request to Firebase. It confirmed
+plain HTTP works but HTTPS does not — which is why the project moved to
+ThingSpeak (plain-HTTP-compatible) instead of continuing to pursue Firebase.
+Kept for reference; not part of the current firmware.
 
-It answers one question: can your specific SIM900A module complete a real
-HTTPS request to Firebase? This matters because:
+## lora_diagnostic/
 
-- Firebase's REST API requires TLS 1.2+ with SNI.
-- SIM900A's SSL stack is old and widely reported (Arduino forums, GitHub
-  issues) to fail against modern servers like Firebase/Google APIs — but
-  firmware varies board to board, so it's worth confirming on your actual
-  hardware rather than assuming.
-- Separately, SIM900A's `AT+HTTPACTION` only supports GET/POST/HEAD — there's
-  no PUT, and Firebase RTDB does not honor `X-HTTP-Method-Override` (its REST
-  API dispatches strictly on the literal HTTP verb). So even if HTTPS works,
-  writing to a fixed path (`device/state`) still needs a plan that doesn't
-  rely on native PUT.
-
-### How to run it
-
-1. Open `sim900a_https_test.ino` and set `APN` (and `APN_USER`/`APN_PASS` if
-   your SIM needs them).
-2. Wire SIM900A TX → ESP32 GPIO16, SIM900A RX → ESP32 GPIO17, common ground.
-   Use an adequate power supply (2A+) — brownouts during `AT+HTTPACTION` are
-   a common false failure.
-3. Flash it, open Serial Monitor at 115200 baud, and read the full log.
-4. Read the final `VERDICT` block.
-
-### What to do with the result
-
-- **Plain HTTP fails too** → the problem is GPRS/APN/signal, not SSL. Fix
-  that and re-run before trusting anything else.
-- **Plain HTTP works, HTTPS fails** → confirms the known SIM900A limitation.
-  Next step is one of:
-  - Swap the GSM module for one with real TLS support (SIM800-series or
-    SIM7000/SIM7600) — keeps the Firebase schema and dashboard exactly as
-    already built.
-  - Add a small always-on relay (e.g. a cheap VPS) that accepts plain HTTP
-    from the SIM900A and forwards as authenticated HTTPS to Firebase.
-- **HTTPS works** → good news, but the missing-PUT problem is still open —
-  come back to that before writing the main firmware (likely solution:
-  restructure `device/state` writes as POST/push + read-latest-by-query, or
-  find a PATCH-equivalent via a Cloud Function endpoint you control).
-
-The main receiver firmware (relay/LoRa/GSM polling loop) is intentionally
-not written yet — it depends on which of the above paths this test points to.
+A one-shot diagnostic sketch that talks to the SX1278 chip directly over
+SPI (bypassing the `LoRa` library) to read back its version register (0x42,
+should read `0x12` on genuine silicon). Used to debug an earlier
+`LoRa.begin()` failure, which turned out to be a shorted MISO wire — not a
+library or firmware issue. Kept for reference if LoRa init ever fails again.

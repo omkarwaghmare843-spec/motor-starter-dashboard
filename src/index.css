@@ -350,7 +350,7 @@ body {
 
 .log-row {
   display: grid;
-  grid-template-columns: 70px 70px 120px 1fr;
+  grid-template-columns: 70px 70px 1fr;
   gap: 12px;
   align-items: center;
   padding: 11px 8px;
@@ -374,10 +374,6 @@ body {
 .log-voltage {
   color: var(--text);
   font-variant-numeric: tabular-nums;
-}
-
-.log-source {
-  color: var(--muted);
 }
 
 .log-time {

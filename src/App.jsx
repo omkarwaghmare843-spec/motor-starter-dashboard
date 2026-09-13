@@ -17,19 +17,6 @@ function formatTimeAgo(ts) {
   return `${hr}h ago`
 }
 
-function sourceLabel(source) {
-  switch (source) {
-    case 'dashboard':
-      return 'Dashboard'
-    case 'lora':
-      return 'LoRa remote'
-    case 'auto':
-      return 'Auto-protection'
-    default:
-      return 'Unknown'
-  }
-}
-
 export default function App() {
   const { state, command, loading, isOnline, sendCommand } = useDevice()
   const history = useHistory(50)
@@ -141,7 +128,6 @@ export default function App() {
                     {entry.motorStatus}
                   </span>
                   <span className="log-voltage">{entry.voltage != null ? `${entry.voltage.toFixed(1)}V` : '—'}</span>
-                  <span className="log-source">{sourceLabel(entry.source)}</span>
                   <span className="log-time">{new Date(entry.timestamp).toLocaleString()}</span>
                 </div>
               ))}
