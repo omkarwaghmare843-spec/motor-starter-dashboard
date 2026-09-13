@@ -45,20 +45,59 @@ LoRa SCK/MISO/MOSI use the ESP32's default hardware SPI pins (18/19/23) via
 the `LoRa` library's defaults — only override these if your board doesn't
 use the default VSPI pins.
 
-### LoRa protocol (assumed — confirm against the TX firmware once written)
+### LoRa protocol
 
-Plain text payloads: `MSTR:START` / `MSTR:STOP`. The TX side (ESP8266 + 2
-buttons + LoRa, schematic to follow) needs to send exactly this format —
-update both sides together if this changes.
+Plain text payloads: `MSTR:START` / `MSTR:STOP`. Implemented identically on
+both sides — see `motor_starter_tx/` below.
 
 ### What's deliberately NOT in this build
 
 - No GSM/SIM900A code — on hold.
 - No Firebase reporting — the dashboard won't reflect LoRa-triggered
   start/stop until GSM sync is added back in.
-- No debounce/anti-repeat on the TX button side — that's the transmitter's
-  job once its firmware exists; this RX firmware only debounces at the
-  command level (`COMMAND_COOLDOWN_MS`), not at the physical button level.
+- No debounce/anti-repeat on the TX button side needed here — the
+  transmitter (`motor_starter_tx/`) already debounces at the button level,
+  so this RX firmware only needs its own command-level cooldown
+  (`COMMAND_COOLDOWN_MS`) as a second line of defense.
+
+## motor_starter_tx/
+
+The remote transmitter firmware (ESP8266) — reads the start/stop buttons and
+sends `MSTR:START` / `MSTR:STOP` over LoRa to the RX unit.
+
+### Pin mapping — requires a board rewire, not just a firmware setting
+
+The schematic wires LoRa CLK to GPIO16. **This can't work as drawn**: GPIO16
+is not one of the ESP8266's hardware SPI pins (only GPIO12/13/14 are — this
+is fixed in silicon, unlike the ESP32 where SPI pins are software-selectable),
+so the SPI-based LoRa library cannot use it for SCK.
+
+The firmware instead targets this corrected mapping — **the physical LoRa
+module wiring needs to move to match it**:
+
+| Signal     | Firmware pin | Schematic originally had |
+|------------|-------------|---------------------------|
+| LoRa SCK   | GPIO14 (fixed HSPI SCK) | GPIO16 |
+| LoRa MISO  | GPIO12 (fixed HSPI MISO) | GPIO14 |
+| LoRa MOSI  | GPIO13 (fixed HSPI MOSI) | GPIO12 |
+| LoRa CS    | GPIO16 | GPIO2 |
+| LoRa RESET | GPIO2 | GPIO13 |
+| Start button | GPIO5 | GPIO5 (unchanged) |
+| Stop button  | GPIO4 | GPIO4 (unchanged) |
+
+CS and RESET are plain GPIO toggles either way (the LoRa library doesn't use
+real hardware chip-select), so moving those two is free — only SCK/MISO/MOSI
+are hardware-constrained.
+
+### Behavior
+
+- Buttons are wired active-LOW to GND (`INPUT_PULLUP`), debounced in
+  software (`DEBOUNCE_MS`, default 250ms).
+- Sends one `MSTR:START`/`MSTR:STOP` packet per press (on the press edge,
+  not repeated while held).
+- No sleep/low-power mode yet — worth adding if this is battery-powered and
+  needs long runtime between charges (deep sleep + wake-on-button-interrupt
+  would be the next step, not implemented here).
 
 ## sim900a_https_test/
 
