@@ -1,5 +1,65 @@
 # Firmware
 
+## motor_starter_rx/
+
+The main receiver firmware — currently **LoRa + DOL starter control only**.
+GSM/Firebase sync is deliberately left out of this build: the SIM900A module
+is not working on the current board, so that integration is on hold and will
+be added back as a separate step once it's sorted out (see
+`sim900a_https_test/` below for the still-open HTTPS question on that front).
+
+What it does:
+- Listens for LoRa packets (polled via `LoRa.parsePacket()` — no DIO0
+  interrupt line is wired on this board, per the schematic, so it can't use
+  an interrupt-driven receive).
+- Validates a `MSTR:` prefix on the payload before acting on it, to reject
+  stray packets from other 433MHz devices sharing the band — a real safety
+  consideration since this controls a physical motor starter. Recognized
+  commands: `MSTR:START`, `MSTR:STOP`.
+- Drives the two relay channels (start/stop) as **momentary pulses**
+  (`RELAY_PULSE_MS`, default 700ms), matching a standard self-latching DOL
+  starter: the starter's own auxiliary contact holds the contactor in after
+  a start pulse, and a stop pulse breaks that latch — the ESP32 does not
+  hold either relay energized continuously.
+- Applies a cooldown (`COMMAND_COOLDOWN_MS`) so a burst of repeated/duplicate
+  LoRa packets can't rapid-fire the relays.
+- Reads the voltage sense line and logs it over USB serial every 5s (no
+  cloud reporting yet, by design — see above).
+
+### Pin mapping — confirm before flashing
+
+The schematic's exact GPIO numbers weren't reliably extractable from the
+PDF text layer, so the `#define`s at the top of `motor_starter_rx.ino` use
+sensible ESP32 defaults (avoiding strapping pins 0/2/15 and input-only pins
+34-39 for outputs). **Check these against your actual board before flashing**:
+
+```
+LORA_NSS_PIN        5
+LORA_RST_PIN        27
+START_RELAY_PIN     25
+STOP_RELAY_PIN      26
+VOLTAGE_SENSOR_PIN  34
+```
+
+LoRa SCK/MISO/MOSI use the ESP32's default hardware SPI pins (18/19/23) via
+the `LoRa` library's defaults — only override these if your board doesn't
+use the default VSPI pins.
+
+### LoRa protocol (assumed — confirm against the TX firmware once written)
+
+Plain text payloads: `MSTR:START` / `MSTR:STOP`. The TX side (ESP8266 + 2
+buttons + LoRa, schematic to follow) needs to send exactly this format —
+update both sides together if this changes.
+
+### What's deliberately NOT in this build
+
+- No GSM/SIM900A code — on hold.
+- No Firebase reporting — the dashboard won't reflect LoRa-triggered
+  start/stop until GSM sync is added back in.
+- No debounce/anti-repeat on the TX button side — that's the transmitter's
+  job once its firmware exists; this RX firmware only debounces at the
+  command level (`COMMAND_COOLDOWN_MS`), not at the physical button level.
+
 ## sim900a_https_test/
 
 A one-shot diagnostic sketch — **flash this first, before any real firmware.**
