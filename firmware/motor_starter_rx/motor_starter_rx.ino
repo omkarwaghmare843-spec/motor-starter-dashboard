@@ -103,7 +103,7 @@
 // ThingSpeak configuration
 // ---------------------------------------------------------------------------
 
-static const char *APN      = "internet";   // set to your SIM's APN
+static const char *APN      = "airtelgprs.com";   // Airtel India data APN
 static const char *APN_USER = "";
 static const char *APN_PASS = "";
 
