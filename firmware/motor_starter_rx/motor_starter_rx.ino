@@ -25,7 +25,7 @@
       breaks that latch.
     - Voltage sense ("vtg") from an LM358-based AC transformer sense module
       into an ESP32 ADC input.
-    - SIM900A GSM/GPRS module on SoftwareSerial.
+    - SIM900A GSM/GPRS module on ESP32 hardware UART2.
 
   Why ThingSpeak instead of Firebase:
     Firebase's REST API requires TLS 1.2+/SNI, which SIM900A's SSL stack
@@ -65,7 +65,7 @@
 
 #include <SPI.h>
 #include <LoRa.h>
-#include <SoftwareSerial.h>
+#include <HardwareSerial.h>
 
 // ---------------------------------------------------------------------------
 // Pin configuration — CONFIRM/CORRECT these against your actual PCB wiring
@@ -87,10 +87,10 @@
 #define VOLTAGE_SENSOR_PIN 34
 #define VOLTAGE_SCALE      110.0   // calibrate: real_voltage = adc_volts * VOLTAGE_SCALE
 
-// GSM SIM900A (SoftwareSerial) — confirm these against your actual wiring
-#define GSM_RX_PIN 16   // ESP32 pin that receives from SIM900A TX
-#define GSM_TX_PIN 17   // ESP32 pin that transmits to SIM900A RX
-#define GSM_BAUD   9600
+// GSM SIM900A (hardware UART2) — confirm these against your actual wiring
+#define GSM_RX_PIN 21   // ESP32 pin that receives from SIM900A TX
+#define GSM_TX_PIN 22   // ESP32 pin that transmits to SIM900A RX
+#define GSM_BAUD   115200   // must match the module's configured UART baud, not SIM900A's power-on default (9600)
 
 // ---------------------------------------------------------------------------
 // DOL starter timing
@@ -145,7 +145,7 @@ unsigned long lastCommandMs = 0;
 unsigned long lastVoltageLogMs = 0;
 #define VOLTAGE_LOG_INTERVAL_MS 5000
 
-SoftwareSerial gsmSerial(GSM_RX_PIN, GSM_TX_PIN);
+HardwareSerial gsmSerial(2);   // UART2 — avoids SoftwareSerial's timing issues at 115200 baud
 bool gprsReady = false;
 unsigned long lastSyncMs = 0;
 
@@ -270,6 +270,9 @@ void handleLoraPacket(int packetSize) {
 String gsmSendCommand(const String &cmd, const char *expect = "OK", unsigned long timeoutMs = GSM_CMD_TIMEOUT_MS) {
   while (gsmSerial.available()) gsmSerial.read();   // flush stale bytes
 
+  Serial.print("[GSM >] ");
+  Serial.println(cmd);
+
   gsmSerial.print(cmd);
   gsmSerial.print("\r\n");
 
@@ -283,18 +286,103 @@ String gsmSendCommand(const String &cmd, const char *expect = "OK", unsigned lon
       break;
     }
   }
+
+  String trimmed = response;
+  trimmed.trim();
+  if (trimmed.length() == 0) {
+    Serial.println("[GSM <] (no response / timeout)");
+  } else {
+    Serial.print("[GSM <] ");
+    Serial.println(trimmed);
+  }
+
   return response;
+}
+
+// Waits for the module's unsolicited boot banner ("RDY") after power-up.
+// SIM900A can take a couple seconds after RDY before it reliably answers
+// plain AT commands -- sending AT immediately after boot is a common cause
+// of getting silence back even though the module is otherwise fine.
+bool waitForModemReady(unsigned long timeoutMs) {
+  Serial.println("[GSM] Waiting for module boot banner (RDY)...");
+  String buf;
+  unsigned long start = millis();
+  while (millis() - start < timeoutMs) {
+    while (gsmSerial.available()) {
+      char c = (char)gsmSerial.read();
+      buf += c;
+      Serial.write(c);   // echo raw boot banner as it streams in
+    }
+    if (buf.indexOf("RDY") != -1) {
+      Serial.println("\n[GSM] Boot banner seen (RDY)");
+      return true;
+    }
+  }
+  Serial.println("\n[GSM] No RDY banner seen within timeout — module may already be up, or not powered/wired correctly");
+  return false;
+}
+
+// Retries plain "AT" a few times with short gaps -- covers both the
+// just-after-RDY settling time and general link flakiness.
+bool pingModem(int attempts = 5) {
+  for (int i = 0; i < attempts; i++) {
+    Serial.print("[GSM] AT ping attempt ");
+    Serial.print(i + 1);
+    Serial.print("/");
+    Serial.println(attempts);
+    String resp = gsmSendCommand("AT", "OK", 2000);
+    if (resp.indexOf("OK") != -1) {
+      Serial.println("[GSM] Modem responding to AT");
+      return true;
+    }
+    delay(500);
+  }
+  Serial.println("[GSM] Modem NOT responding to AT after retries -- check GSM_BAUD, wiring, and power supply (SIM900A needs a solid 2A+ 3.7-4.2V supply; brownouts during TX are a common cause of exactly this symptom)");
+  return false;
+}
+
+bool checkSimPresent() {
+  String resp = gsmSendCommand("AT+CPIN?", "OK", 5000);
+  if (resp.indexOf("+CPIN: READY") != -1) {
+    Serial.println("[GSM] SIM detected and ready (+CPIN: READY)");
+    return true;
+  }
+  if (resp.indexOf("NOT INSERTED") != -1) {
+    Serial.println("[GSM] *** SIM NOT DETECTED *** -- check SIM seating/orientation, then power-cycle the module (not just reset)");
+    return false;
+  }
+  if (resp.indexOf("+CPIN:") != -1) {
+    Serial.print("[GSM] SIM present but not ready: ");
+    Serial.println(resp);
+    return false;
+  }
+  Serial.println("[GSM] Could not read SIM status (no response to AT+CPIN?)");
+  return false;
 }
 
 bool gsmInitModem() {
   Serial.println("[GSM] Initializing modem...");
-  gsmSendCommand("AT");
+
+  waitForModemReady(5000);   // don't hard-fail on this -- module might already be past boot
+
+  if (!pingModem()) {
+    return false;
+  }
+
   gsmSendCommand("ATE0");
   gsmSendCommand("AT+CMEE=2");
 
+  if (!checkSimPresent()) {
+    return false;   // no point checking network registration without a SIM
+  }
+
+  String signalResp = gsmSendCommand("AT+CSQ", "OK");
+  Serial.print("[GSM] Signal quality raw: ");
+  Serial.println(signalResp);
+
   String reg = gsmSendCommand("AT+CREG?", "OK");
   bool registered = reg.indexOf("+CREG: 0,1") != -1 || reg.indexOf("+CREG: 0,5") != -1;
-  Serial.println(registered ? "[GSM] Registered on network" : "[GSM] Not registered yet");
+  Serial.println(registered ? "[GSM] Registered on network" : "[GSM] Not registered on network yet (check antenna/signal/SIM activation)");
   return registered;
 }
 
@@ -311,33 +399,74 @@ int gsmSignalQuality() {
 }
 
 bool gsmAttachGprs() {
-  Serial.println("[GSM] Attaching GPRS...");
+  Serial.print("[GSM] Attaching GPRS with APN \"");
+  Serial.print(APN);
+  Serial.println("\"...");
+
   gsmSendCommand("AT+SAPBR=3,1,\"Contype\",\"GPRS\"");
   gsmSendCommand("AT+SAPBR=3,1,\"APN\",\"" + String(APN) + "\"");
   if (strlen(APN_USER) > 0) gsmSendCommand("AT+SAPBR=3,1,\"USER\",\"" + String(APN_USER) + "\"");
   if (strlen(APN_PASS) > 0) gsmSendCommand("AT+SAPBR=3,1,\"PWD\",\"" + String(APN_PASS) + "\"");
-  gsmSendCommand("AT+SAPBR=1,1", "OK", GSM_CMD_TIMEOUT_MS * 2);
-  String status = gsmSendCommand("AT+SAPBR=2,1", "OK");
 
+  Serial.println("[GSM] Opening GPRS bearer (this can take several seconds)...");
+  String openResp = gsmSendCommand("AT+SAPBR=1,1", "OK", GSM_CMD_TIMEOUT_MS * 2);
+  if (openResp.indexOf("ERROR") != -1) {
+    Serial.println("[GSM] AT+SAPBR=1,1 returned ERROR -- APN may be wrong, or no data service on this SIM");
+  }
+
+  String status = gsmSendCommand("AT+SAPBR=2,1", "OK");
   bool ok = status.indexOf("+SAPBR: 1,1") != -1;
-  Serial.println(ok ? "[GSM] GPRS bearer open" : "[GSM] GPRS bearer NOT open");
+
+  if (ok) {
+    Serial.println("[GSM] GPRS bearer open");
+  } else {
+    Serial.print("[GSM] GPRS bearer NOT open, status: ");
+    Serial.println(status);
+  }
   return ok;
 }
 
 // Plain HTTP GET via SIM900A's AT+HTTPACTION=0 (ThingSpeak's classic API
 // works over unencrypted HTTP, so no AT+HTTPSSL is used here at all).
 bool gsmHttpGet(const String &url, String &responseOut) {
+  Serial.print("[HTTP] GET ");
+  Serial.println(url);
+
   gsmSendCommand("AT+HTTPTERM");   // clear any stale session, ignore result
   gsmSendCommand("AT+HTTPINIT");
   gsmSendCommand("AT+HTTPPARA=\"CID\",1");
   gsmSendCommand("AT+HTTPPARA=\"URL\",\"" + url + "\"");
 
-  gsmSendCommand("AT+HTTPACTION=0", "+HTTPACTION:", GSM_HTTP_TIMEOUT_MS);
+  String actionResp = gsmSendCommand("AT+HTTPACTION=0", "+HTTPACTION:", GSM_HTTP_TIMEOUT_MS);
+  if (actionResp.indexOf("+HTTPACTION:") == -1) {
+    Serial.println("[HTTP] No +HTTPACTION response -- request likely timed out (GPRS down, or server unreachable)");
+    gsmSendCommand("AT+HTTPTERM");
+    responseOut = "";
+    return false;
+  }
+
+  int httpStatus = -1;
+  int actionIdx = actionResp.indexOf("+HTTPACTION:");
+  int firstComma = actionResp.indexOf(',', actionIdx);
+  int secondComma = actionResp.indexOf(',', firstComma + 1);
+  if (firstComma != -1 && secondComma != -1) {
+    httpStatus = actionResp.substring(firstComma + 1, secondComma).toInt();
+  }
+  Serial.print("[HTTP] Status code: ");
+  Serial.println(httpStatus);
+
   String readResp = gsmSendCommand("AT+HTTPREAD", "OK", GSM_HTTP_TIMEOUT_MS);
   responseOut = readResp;
 
   gsmSendCommand("AT+HTTPTERM");
-  return responseOut.indexOf("ERROR") == -1;
+
+  bool ok = (httpStatus == 200);
+  if (!ok) {
+    Serial.print("[HTTP] Request did not return 200 (got ");
+    Serial.print(httpStatus);
+    Serial.println(") -- check API key/channel ID/URL");
+  }
+  return ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -383,30 +512,38 @@ void writeDeviceState(const char *source) {
 }
 
 void ackCommand(int desiredState, unsigned long issuedAt) {
+  Serial.println("[TS] Acking command on Channel B...");
   String url = "http://api.thingspeak.com/update?api_key=" + String(TS_CMD_WRITE_KEY) +
                "&field1=" + String(desiredState) +
                "&field2=" + String(issuedAt) +
                "&field3=1";
   String resp;
-  gsmHttpGet(url, resp);
+  bool ok = gsmHttpGet(url, resp);
+  Serial.println(ok ? "[TS] Ack sent" : "[TS] Ack FAILED");
 }
 
 void syncWithThingSpeak() {
+  Serial.println("\n[TS] ---- Sync cycle starting ----");
+  Serial.println("[TS] Reading command channel...");
+
   String url = "http://api.thingspeak.com/channels/" + String(TS_CMD_CHANNEL_ID) +
                "/feeds/last.json?api_key=" + String(TS_CMD_READ_KEY);
 
   String resp;
   if (!gsmHttpGet(url, resp)) {
-    Serial.println("[TS] Failed to read command channel");
+    Serial.println("[TS] Failed to read command channel -- skipping this sync cycle");
     return;
   }
+
+  Serial.print("[TS] Command channel response: ");
+  Serial.println(resp);
 
   float desiredStateF = extractJsonField(resp, "field1");
   float issuedAtF     = extractJsonField(resp, "field2");
   float ackF          = extractJsonField(resp, "field3");
 
   if (isnan(desiredStateF) || isnan(ackF)) {
-    Serial.println("[TS] Could not parse command response");
+    Serial.println("[TS] Could not parse command response -- skipping this sync cycle");
     return;
   }
 
@@ -414,18 +551,29 @@ void syncWithThingSpeak() {
   bool ack = ackF >= 1;
   unsigned long issuedAt = isnan(issuedAtF) ? 0 : (unsigned long)issuedAtF;
 
+  Serial.print("[TS] Parsed: desiredState=");
+  Serial.print(wantOn ? "ON" : "OFF");
+  Serial.print(" ack=");
+  Serial.print(ack ? "true" : "false");
+  Serial.print(" currentMotorState=");
+  Serial.println(motorState == MOTOR_ON ? "ON" : "OFF");
+
   bool applied = false;
   if (!ack && wantOn != (motorState == MOTOR_ON)) {
     Serial.println(String("[TS] Applying dashboard command: ") + (wantOn ? "ON" : "OFF"));
     if (wantOn) startMotor(); else stopMotor();
     applied = true;
+  } else if (!ack) {
+    Serial.println("[TS] Command already matches current motor state -- nothing to apply, just acking");
   }
 
   if (!ack) {
     ackCommand(wantOn ? 1 : 0, issuedAt);
   }
 
+  Serial.println("[TS] Reporting state back to Channel A...");
   writeDeviceState(applied ? "dashboard" : "poll");
+  Serial.println("[TS] ---- Sync cycle done ----\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -446,7 +594,7 @@ void setup() {
 
   setupLora();
 
-  gsmSerial.begin(GSM_BAUD);
+  gsmSerial.begin(GSM_BAUD, SERIAL_8N1, GSM_RX_PIN, GSM_TX_PIN);
   gprsReady = gsmInitModem() && gsmAttachGprs();
   if (!gprsReady) {
     Serial.println("[BOOT] GPRS not ready yet — will keep retrying in main loop");
@@ -480,3 +628,4 @@ void loop() {
     syncWithThingSpeak();
   }
 }
+ 
