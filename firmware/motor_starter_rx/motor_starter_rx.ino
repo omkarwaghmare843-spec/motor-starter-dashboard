@@ -508,7 +508,20 @@ bool gsmHttpRequest(int method, const String &url, const String &extraHeader, co
     Serial.println("[HTTP] Non-HTTP status code on an HTTPS request often means the TLS handshake itself failed -- see AT+CSSLCFG confidence note in file header");
   }
 
-  String readResp = gsmSendCommand("AT+HTTPREAD", "OK", GSM_HTTP_TIMEOUT_MS);
+  // A7670C's HTTP-A stack rejects the bare "AT+HTTPREAD" (no arguments)
+  // with ERROR -- unlike SIM800/SIM900, it strictly requires the
+  // parameterized form AT+HTTPREAD=<start_address>,<byte_length>, where
+  // start_address is a byte offset into the buffered response body (0 for
+  // the beginning) and byte_length is how many bytes to read from there
+  // (safe to request more than the actual remaining body -- the module
+  // just returns what's left; it does not error on an oversized length).
+  int contentLen = -1;
+  int thirdComma = actionResp.indexOf(',', secondComma + 1);
+  if (secondComma != -1) {
+    contentLen = actionResp.substring(secondComma + 1, thirdComma == -1 ? actionResp.length() : thirdComma).toInt();
+  }
+  if (contentLen <= 0) contentLen = 1024;   // fallback if length wasn't parsed
+  String readResp = gsmSendCommand("AT+HTTPREAD=0," + String(contentLen), "OK", GSM_HTTP_TIMEOUT_MS);
   responseOut = readResp;
 
   gsmSendCommand("AT+HTTPTERM");
