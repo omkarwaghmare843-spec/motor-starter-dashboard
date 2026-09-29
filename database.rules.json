@@ -1,0 +1,19 @@
+{
+  "rules": {
+    "device": {
+      "state": {
+        ".read": true,
+        ".write": true
+      },
+      "command": {
+        ".read": true,
+        ".write": true
+      },
+      "history": {
+        ".read": true,
+        ".write": true,
+        ".indexOn": ["timestamp"]
+      }
+    }
+  }
+}

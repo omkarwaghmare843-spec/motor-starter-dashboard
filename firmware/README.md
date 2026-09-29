@@ -2,7 +2,7 @@
 
 ## motor_starter_rx/
 
-The main receiver firmware — LoRa + DOL starter control + GSM/ThingSpeak sync.
+The main receiver firmware — LoRa + DOL starter control + GSM/Firebase sync.
 
 What it does:
 - Listens for LoRa packets (polled via `LoRa.parsePacket()` — no DIO0
@@ -19,46 +19,46 @@ What it does:
   hold either relay energized continuously.
 - Applies a cooldown (`COMMAND_COOLDOWN_MS`) so a burst of repeated/duplicate
   LoRa packets can't rapid-fire the relays.
-- Polls ThingSpeak over the SIM900A GSM/GPRS module (`SYNC_INTERVAL_MS`,
-  default 30s) for dashboard commands, applies them, and reports state back.
-  See "Why ThingSpeak, not Firebase" below.
-- A LoRa-triggered start/stop also pushes an immediate ThingSpeak state
-  update (when GPRS is up), so the dashboard reflects a remote-triggered
+- Polls Firebase over the A7670C 4G/LTE module (`SYNC_INTERVAL_MS`, default
+  20s) for dashboard commands, applies them, and reports state back. See
+  "Firebase over A7670C" below.
+- A LoRa-triggered start/stop also pushes an immediate Firebase update (when
+  the module is online), so the dashboard reflects a remote-triggered
   start/stop without waiting for the next poll cycle.
 - Reads the voltage sense line and logs it over USB serial every 5s.
 
-### Why ThingSpeak, not Firebase
+### Firebase over A7670C
 
-Firebase's REST API requires TLS 1.2+/SNI, which SIM900A's SSL stack cannot
-reliably complete — confirmed by testing (`sim900a_https_test/`, below) and
-by trying to build the original Firebase-based firmware. Even where HTTPS
-worked, Firebase also needs a real `PUT` to overwrite a fixed path, and
-SIM900A's `AT+HTTPACTION` only supports GET/POST/HEAD — Firebase's REST API
-does not honor an `X-HTTP-Method-Override` workaround either, so that's a
-dead end regardless of the TLS question.
+The project's original module (SIM900A, 2G) had two hard blockers for
+talking to Firebase's REST API directly: no working TLS stack (Firebase
+needs TLS 1.2+/SNI), and no `PUT` verb in its HTTP AT command set (only
+GET/POST/HEAD). Those blockers led to a stint on ThingSpeak (plain-HTTP
+compatible, still in git history if useful) before switching to A7670C.
 
-ThingSpeak's classic write API (plain HTTP GET, e.g.
-`http://api.thingspeak.com/update?api_key=...&field1=...`) was verified live
-to still work over plain, unencrypted HTTP — exactly what SIM900A's
-`AT+HTTPACTION=0` can do. The dashboard (`src/thingspeak.js`) and this
-firmware both talk to the same two ThingSpeak channels:
+A7670C is a genuine 4G/LTE module with a real TLS stack (`AT+CSSLCFG`),
+solving the HTTPS problem. It still only exposes GET/POST/HEAD at the
+`AT+HTTPACTION` layer — but Firebase's REST API
+[officially documents](https://firebase.google.com/docs/database/rest/save-data)
+honoring an `X-HTTP-Method-Override: PUT` header on a `POST` to get full
+overwrite (PUT) semantics. So every "write" in this firmware is actually a
+`POST` with that header, not a native PUT — and Firebase treats it exactly
+like a PUT per its own docs.
 
-```
-Channel A — device state (this firmware writes, dashboard reads)
-  field1 = motorStatus   (0=OFF, 1=ON)
-  field2 = voltage
-  field3 = gsmSignal
-  field4 = lastSeen       (device uptime seconds — no RTC/NTP on this board)
+**Confidence note:** the exact `AT+CSSLCFG` parameter values (SSL context
+index, TLS version code, and whether HTTPS binds via
+`AT+HTTPPARA="SSLCFG",<ctxid>` or a separate flag) are based on the general
+SIMCOM A76xx/SIM7600 AT command family and have **not** been verified
+against A7670C's own manual for your specific firmware revision. If HTTPS
+requests fail specifically (while plain AT commands/network registration
+work fine), check SIMCOM's "A76XX Series_HTTP(S)_Application Note" PDF for
+your firmware version — command details are known to drift between SIMCOM
+firmware releases. GPRS/PDP context activation also uses the more standard
+`AT+CGDCONT`/`AT+CGACT` (3GPP) commands rather than SIM800/900's
+`AT+SAPBR`, since A76xx-family modules may not implement the latter at all.
 
-Channel B — commands (dashboard writes, this firmware reads + acks)
-  field1 = desiredState   (0=OFF, 1=ON)
-  field2 = issuedAt       (unix seconds, from the browser's clock)
-  field3 = ack            (0=pending, 1=applied by device)
-```
-
-Two channels (rather than one shared channel) so device-write and
-dashboard-write traffic don't compete for ThingSpeak's free-tier rate limit
-of roughly one write per 15 seconds per channel.
+Firebase Realtime Database schema (`device/state`, `device/command`,
+`device/history`) is unchanged from the original design — see the main
+`README.md` for the full schema and firmware contract.
 
 ### Pin mapping (confirmed working on the actual board)
 
@@ -69,19 +69,22 @@ START_RELAY_PIN     2
 STOP_RELAY_PIN      15
 RELAY_ACTIVE_HIGH   false
 VOLTAGE_SENSOR_PIN  34
-GSM_RX_PIN          16
-GSM_TX_PIN          17
+GSM_RX_PIN          21
+GSM_TX_PIN          22
+GSM_BAUD            115200
 ```
 
-LoRa SCK/MISO/MOSI use the ESP32's default hardware SPI pins (18/19/23).
+LoRa SCK/MISO/MOSI use the ESP32's default hardware SPI pins (18/19/23). GSM
+uses hardware UART2 (not `SoftwareSerial`, which is unreliable at 115200
+baud on ESP32).
 
-### ThingSpeak / GSM config
+### Firebase / GSM config
 
-Set `APN` (and `APN_USER`/`APN_PASS` if your SIM needs them) and the four
-ThingSpeak keys/channel IDs near the top of `motor_starter_rx.ino` — this
-firmware needs the state channel's **write** key and the command channel's
-**read + write** keys (the dashboard needs the mirror image: state read key,
-command read + write keys — see the main `README.md`).
+Set `APN` (Airtel India: `airtelgprs.com`) and `FIREBASE_HOST` near the top
+of `motor_starter_rx.ino` to match your Firebase project (same project the
+dashboard uses — see `src/firebase.js` / `.env` in the project root). No API
+keys needed here since Firebase's REST API is reached directly by host +
+path, unlike ThingSpeak's per-channel keys.
 
 ### LoRa protocol
 
@@ -128,11 +131,13 @@ SCK/MISO/MOSI are the hardware-constrained ones.
 
 ## sim900a_https_test/
 
-A one-shot diagnostic sketch that answered the question of whether this
-SIM900A module can complete a real HTTPS request to Firebase. It confirmed
-plain HTTP works but HTTPS does not — which is why the project moved to
-ThingSpeak (plain-HTTP-compatible) instead of continuing to pursue Firebase.
-Kept for reference; not part of the current firmware.
+A one-shot diagnostic sketch from when the project used a SIM900A (2G)
+module. It answered the question of whether SIM900A could complete a real
+HTTPS request to Firebase. It confirmed plain HTTP works but HTTPS does not
+— which is why the project moved to ThingSpeak (plain-HTTP-compatible) for a
+while, before switching hardware to the A7670C (which has a real TLS stack)
+and moving back to Firebase. Kept for reference; not applicable to A7670C
+and not part of the current firmware.
 
 ## lora_diagnostic/
 

@@ -1,84 +1,95 @@
 # Motor Starter Dashboard
 
-Web dashboard to monitor and control a DOL motor starter built around an ESP32 with LoRa (SX1278) and GSM (SIM900A). The ESP32 has no WiFi/Ethernet — it reaches the internet only over GPRS through the SIM900A — so this dashboard does **not** talk to the device directly. Instead, ThingSpeak acts as the shared mailbox between the dashboard, the device, and the LoRa remote:
+Web dashboard to monitor and control a DOL motor starter built around an ESP32 with LoRa (SX1278) and a SIMCOM A7670C 4G/LTE module. The ESP32 has no WiFi/Ethernet — it reaches the internet only over cellular data through the A7670C — so this dashboard does **not** talk to the device directly. Instead, Firebase Realtime Database acts as the shared mailbox between the dashboard, the device, and the LoRa remote:
 
 ```
-[Dashboard] <---> [ThingSpeak] <---> [ESP32 over GSM/GPRS] <---LoRa--- [Remote transmitter]
+[Dashboard] <---> [Firebase Realtime DB] <---> [ESP32 over 4G/LTE] <---LoRa--- [Remote transmitter]
 ```
 
-## Why ThingSpeak, not Firebase
+## History: why this isn't ThingSpeak anymore
 
-Firebase's REST API requires TLS 1.2+/SNI, which the SIM900A's SSL stack cannot reliably complete — confirmed on real hardware, not just in theory. Even where SIM900A's HTTPS worked at all, Firebase also needs a genuine `PUT` to overwrite a fixed path, and SIM900A's `AT+HTTPACTION` only supports GET/POST/HEAD. ThingSpeak's classic write API (`http://api.thingspeak.com/update?api_key=...&field1=...`) was verified live to still work over plain, unencrypted HTTP — exactly what `AT+HTTPACTION=0` (GET) can do.
+The project originally used a SIM900A (2G) module, which has two hard blockers for talking to Firebase's REST API: no working TLS stack (Firebase requires TLS 1.2+/SNI, confirmed unreachable on real SIM900A hardware) and no `PUT` verb in its HTTP AT command set (only GET/POST/HEAD). That led to a stint on ThingSpeak, whose classic write API works over plain, unencrypted HTTP.
 
-The tradeoff: ThingSpeak is a numeric-fields-per-channel model (up to 8 fields per channel), not Firebase's flexible JSON tree, and free-tier channels are rate-limited to roughly one write per 15 seconds.
+The project has since switched to a **SIMCOM A7670C** 4G/LTE module, which has a genuine TLS stack — solving the HTTPS problem — and moved back to Firebase for its more flexible schema and realtime dashboard updates (no polling needed). A7670C still only exposes GET/POST/HEAD at the AT command layer, so writes use `POST` with an `X-HTTP-Method-Override: PUT` header, which [Firebase's REST API officially documents supporting](https://firebase.google.com/docs/database/rest/save-data) as a way to achieve full-overwrite PUT semantics without a native PUT verb.
 
 ## Data flow
 
-- The dashboard writes a **command** to the command channel when you click Start/Stop.
-- The ESP32 polls the command channel over GPRS on an interval, applies it, writes the resulting **state** to the state channel, and acks the command.
-- If the LoRa remote starts/stops the motor locally, the ESP32 pushes an immediate state update (tagged as applied) so the dashboard reflects it without waiting for the next poll.
-- The state channel's own entry history (ThingSpeak stores every write with a timestamp) doubles as the event log and voltage chart — no separate history channel needed.
+- The dashboard writes a **command** when you click Start/Stop.
+- The ESP32 polls Firebase over the A7670C on an interval, reads the command, drives the relay, then writes back the resulting **state** (and acks the command).
+- If the LoRa remote starts/stops the motor locally, the ESP32 (receiver side) updates `device/state` and `device/command` in Firebase the same way, so the dashboard reflects it automatically.
+- Every state change also appends an entry to `device/history` for the event log and voltage chart.
+- Since Firebase pushes updates in realtime, the dashboard reflects device state changes immediately — no polling delay (unlike the ThingSpeak-era dashboard).
 
-## ThingSpeak channel layout
-
-Two channels, so device-write and dashboard-write traffic don't compete for the same per-channel rate limit:
+## Firebase Realtime Database schema
 
 ```
-Channel A — device state (ESP32 writes, dashboard reads)
-  field1 = motorStatus   (0=OFF, 1=ON)
-  field2 = voltage
-  field3 = gsmSignal
-  field4 = lastSeen       (device uptime seconds — no RTC/NTP on this board yet)
+device/
+  state/
+    motorStatus: "ON" | "OFF"
+    voltage: number          // from the voltage sensor, in volts
+    lastSeen: number          // device uptime in ms (no RTC/NTP on this board), updated every poll cycle
+    gsmSignal: number         // CSQ reading, -1 if unknown
 
-Channel B — commands (dashboard writes, ESP32 reads + acks)
-  field1 = desiredState   (0=OFF, 1=ON)
-  field2 = issuedAt       (unix seconds, from the browser's clock)
-  field3 = ack            (0=pending, 1=applied by device)
+  command/
+    desiredState: "ON" | "OFF"
+    source: "dashboard" | "lora" | "auto"
+    issuedAt: number          // ms, from whichever clock issued the command
+    ack: boolean              // ESP32 sets true once it has applied this command
+
+  history/
+    <push-id>/
+      motorStatus: "ON" | "OFF"
+      voltage: number
+      source: "dashboard" | "lora" | "auto"
+      timestamp: number
 ```
 
 ### Firmware contract (for the ESP32 receiver + LoRa side)
 
-See `firmware/motor_starter_rx/motor_starter_rx.ino` for the full implementation. Summary:
+See `firmware/motor_starter_rx/motor_starter_rx.ino` for the full implementation and `firmware/README.md` for the A7670C AT command details (including a confidence note on which parts are verified vs. best-guess pending your own hardware testing). Summary:
 
-1. On each poll cycle (`SYNC_INTERVAL_MS`, default 30s — must stay above ThingSpeak's ~15s per-channel rate limit), GET Channel B's last entry.
-2. If `ack == 0` and `desiredState != current motorStatus`, apply it (pulse the relevant relay).
-3. Write Channel A with the resulting `motorStatus`/`voltage`/`gsmSignal`/`lastSeen`, and ack Channel B (`field3=1`).
-4. When the LoRa remote triggers a local start/stop, apply it immediately and push a Channel A update tagged as already-applied — no need to go through Channel B since it was already actioned locally.
-5. The dashboard treats the device as **offline** if the state channel's last entry (`created_at`, ThingSpeak's own server-side receive timestamp) is older than 3 minutes — adjust `OFFLINE_THRESHOLD_MS` in `src/useDevice.js` to match your actual GPRS poll interval.
+1. On each poll cycle (`SYNC_INTERVAL_MS`, default 20s), read `device/command`.
+2. If `command.ack == false` and `command.desiredState != state.motorStatus`, drive the relay accordingly.
+3. Write `device/state` and set `device/command/ack = true` (both via `POST` + `X-HTTP-Method-Override: PUT`).
+4. Push a new entry under `device/history` (plain `POST`, which Firebase treats as a push/new-child) so the dashboard log/chart update.
+5. When the LoRa remote triggers a local start/stop, write `device/command` as already-applied (`source: "lora"`, `ack: true`) and `device/state`/`device/history` directly.
+6. The dashboard treats the device as **offline** if `lastSeen` is older than 3 minutes — adjust `OFFLINE_THRESHOLD_MS` in `src/useDevice.js` to match your actual poll interval.
 
 ## Setup
 
-1. Create a free ThingSpeak account and two channels as described above (Channel A: 4 fields for state, Channel B: 3 fields for commands).
-2. Copy `.env.example` to `.env` and fill in the values from each channel's **API Keys** tab:
+1. Create the Firebase project (Realtime Database, not Firestore) and copy your web app config.
+2. Copy `.env.example` to `.env` and fill in the values from the Firebase console:
    ```
-   VITE_TS_STATE_CHANNEL_ID=
-   VITE_TS_STATE_READ_KEY=
-   VITE_TS_CMD_CHANNEL_ID=
-   VITE_TS_CMD_READ_KEY=
-   VITE_TS_CMD_WRITE_KEY=
+   VITE_FIREBASE_API_KEY=
+   VITE_FIREBASE_AUTH_DOMAIN=
+   VITE_FIREBASE_DATABASE_URL=
+   VITE_FIREBASE_PROJECT_ID=
+   VITE_FIREBASE_STORAGE_BUCKET=
+   VITE_FIREBASE_MESSAGING_SENDER_ID=
+   VITE_FIREBASE_APP_ID=
    ```
-   Note: the dashboard only needs the state channel's **read** key and the command channel's **read + write** keys — it never needs the state channel's write key, since only the device writes state.
 3. Install dependencies and run the dev server:
    ```
    npm install
    npm run dev
    ```
-4. Set the same channel IDs/keys in the ESP32 firmware (`firmware/motor_starter_rx/motor_starter_rx.ino`) — it needs the state channel's **write** key and the command channel's **read + write** keys (the mirror image of the dashboard's needs).
+4. Deploy the database rules in `database.rules.json` via the Firebase console (Realtime Database → Rules) or the Firebase CLI.
+5. Set `FIREBASE_HOST` and `APN` in `firmware/motor_starter_rx/motor_starter_rx.ino` to match your Firebase project and SIM card.
 
-> **Security note:** the command channel's write key is embedded client-side in the dashboard's JS bundle (visible in browser devtools), so anyone who finds it could replay start/stop commands directly against ThingSpeak, bypassing the dashboard's UI. This is an accepted tradeoff for now since there's no dashboard authentication yet either — revisit both together before this goes into unattended production use.
+> **Security note:** `database.rules.json` currently allows open read/write to `device/*` for development convenience, since there's no auth yet. Before going live, add Firebase Authentication and restrict `.write` (at least on `device/command`) to authenticated users, and consider a device secret/token check in the firmware if cellular data costs make you want to minimize unauthorized writes triggering unwanted polls.
 
 ## Project structure
 
-- `src/thingspeak.js` — ThingSpeak REST client: fetch latest state, fetch state history, fetch/send commands.
-- `src/useDevice.js` — polls state + command every ~16s, exposes `sendCommand()` and derived `isOnline`.
-- `src/useHistory.js` — polls the state channel's last N entries every ~30s for the event log and voltage chart.
+- `src/firebase.js` — Firebase app/database init from env vars.
+- `src/useDevice.js` — realtime subscription to `device/state` + `device/command`, exposes `sendCommand()` and derived `isOnline`.
+- `src/useHistory.js` — realtime subscription to the last N `device/history` entries.
 - `src/VoltageChart.jsx` — lightweight inline SVG sparkline, no charting library dependency.
 - `src/App.jsx` — dashboard layout: motor control card, voltage card + chart, event log.
 
 ## Firmware
 
-See `firmware/README.md` for the full breakdown of each sketch (RX receiver + DOL starter control, TX remote, and the diagnostic sketches used to debug the SIM900A HTTPS question and a LoRa wiring fault along the way).
+See `firmware/README.md` for the full breakdown of each sketch (RX receiver + DOL starter control, TX remote, and the diagnostic sketches used along the way — SIM900A HTTPS testing, a LoRa wiring fault, GSM debug logging).
 
 ## Status
 
-Dashboard and RX firmware both talk to ThingSpeak and are believed complete pending your own end-to-end hardware test (GSM polling cycle observed live, dashboard reflecting a real device report). TX (remote) firmware is complete and tested working over LoRa.
+Dashboard and RX firmware both talk to Firebase. TX (remote) firmware is complete and tested working over LoRa. The A7670C's AT command sequence for HTTPS + custom headers (`AT+CSSLCFG`, `AT+HTTPPARA="SSLCFG"`) is based on the general SIMCOM A76xx family and has not yet been verified against this specific module/firmware on real hardware — see the confidence note in `firmware/README.md` before assuming it works untested.

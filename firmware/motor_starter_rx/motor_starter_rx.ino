@@ -6,9 +6,9 @@
       (ESP8266 + 2 buttons + LoRa) and drives the DOL starter's start/stop
       relays accordingly.
     - Reads the voltage sensor (LM358-based AC transformer sense circuit).
-    - Polls ThingSpeak over the SIM900A GSM/GPRS module for dashboard
-      commands, applies them, and reports state back — see the "ThingSpeak
-      sync" section below for why ThingSpeak instead of Firebase.
+    - Talks to Firebase Realtime Database over the A7670C 4G/LTE module for
+      dashboard commands, applies them, and reports state back — see
+      "Firebase over A7670C" below.
 
   Hardware, per Schematic_motor_starter_tx (RX side sheet):
     - ESP32-WROOM-32D
@@ -25,39 +25,41 @@
       breaks that latch.
     - Voltage sense ("vtg") from an LM358-based AC transformer sense module
       into an ESP32 ADC input.
-    - SIM900A GSM/GPRS module on ESP32 hardware UART2.
+    - SIMCOM A7670C 4G/LTE Cat-1 module on ESP32 hardware UART2.
 
-  Why ThingSpeak instead of Firebase:
-    Firebase's REST API requires TLS 1.2+/SNI, which SIM900A's SSL stack
-    cannot reliably complete (confirmed as a real limitation on this
-    hardware, not just theoretical) -- and even if it could, Firebase's
-    REST API needs a real PUT to overwrite a fixed path, which SIM900A's
-    AT+HTTPACTION doesn't support (only GET/POST/HEAD). ThingSpeak's
-    classic write API (plain HTTP GET, e.g.
-    "http://api.thingspeak.com/update?api_key=...&field1=...") was
-    verified live to still work over plain, unencrypted HTTP -- exactly
-    what SIM900A's AT+HTTPACTION GET can do.
+  Firebase over A7670C:
+    Firebase's REST API requires TLS 1.2+/SNI and a real HTTP PUT to
+    overwrite a fixed path. The project's original module (SIM900A, 2G) had
+    neither a working TLS stack nor a PUT verb in its HTTP AT command set,
+    which is why the project moved to ThingSpeak (HTTP-only) for a while.
 
-  ThingSpeak channel layout (two channels, so device-write and
-  dashboard-write traffic don't compete for the same per-channel rate
-  limit -- ThingSpeak's free tier allows roughly one write per 15s per
-  channel):
+    A7670C is a genuine 4G/LTE module with a real TLS stack (AT+CSSLCFG),
+    which solves the HTTPS problem. It still only exposes GET/POST/HEAD at
+    the AT+HTTPACTION layer (no native PUT) -- but Firebase's REST API
+    officially documents honoring an X-HTTP-Method-Override header on a
+    POST to achieve PUT (overwrite) semantics:
+    https://firebase.google.com/docs/database/rest/save-data
+    ("If we are making REST calls from a browser that does not support
+    some of the above methods, Firebase supports the X-HTTP-Method-Override
+    header.") So writes here are POST + that header, not a native PUT.
 
-    Channel A - device state (this firmware writes, dashboard reads):
-      field1 = motorStatus (0=OFF, 1=ON)
-      field2 = voltage
-      field3 = gsmSignal
-      field4 = lastSeen (unix seconds, device's own clock via GSM network time if available)
+    CONFIDENCE NOTE: the exact AT+CSSLCFG parameter values below (SSL
+    context index, TLS version code, and whether HTTPS is enabled via
+    AT+HTTPPARA="SSLCFG",<ctxid> vs a separate flag) are based on the
+    general SIMCOM A76xx/SIM7600 AT command family and have NOT been
+    verified against A7670C's own AT command manual for your specific
+    firmware revision. If AT+HTTPACTION fails specifically on HTTPS
+    requests, check SIMCOM's "A76XX Series_HTTP(S)_Application Note" PDF
+    for your module's firmware version -- this is the authoritative
+    reference with a worked example, and command details are known to
+    drift between SIMCOM firmware releases.
 
-    Channel B - commands (dashboard writes, this firmware reads + acks):
-      field1 = desiredState (0=OFF, 1=ON)
-      field2 = issuedAt (unix seconds)
-      field3 = ack (0=pending, 1=applied by device)
+  Firebase Realtime Database schema (device/state, device/command,
+  device/history) -- see the main README.md for the full schema and
+  firmware contract; unchanged from the original Firebase design.
 
-  Pin assignments below are sensible ESP32 defaults where the PDF
-  schematic's exact GPIO numbers weren't fully legible from the extracted
-  text -- values have since been corrected to match the actual board
-  during bring-up; double check before reflashing on different hardware.
+  Pin assignments below were corrected to match the actual board during
+  bring-up; double check before reflashing on different hardware.
 
   Libraries required (Arduino Library Manager):
     - LoRa (Sandeep Mistry)
@@ -87,10 +89,10 @@
 #define VOLTAGE_SENSOR_PIN 34
 #define VOLTAGE_SCALE      110.0   // calibrate: real_voltage = adc_volts * VOLTAGE_SCALE
 
-// GSM SIM900A (hardware UART2) — confirm these against your actual wiring
-#define GSM_RX_PIN 21   // ESP32 pin that receives from SIM900A TX
-#define GSM_TX_PIN 22   // ESP32 pin that transmits to SIM900A RX
-#define GSM_BAUD   115200   // must match the module's configured UART baud, not SIM900A's power-on default (9600)
+// A7670C 4G/LTE module (hardware UART2) — confirm these against your actual wiring
+#define GSM_RX_PIN 21   // ESP32 pin that receives from A7670C TX
+#define GSM_TX_PIN 22   // ESP32 pin that transmits to A7670C RX
+#define GSM_BAUD   115200   // must match the module's configured UART baud
 
 // ---------------------------------------------------------------------------
 // DOL starter timing
@@ -100,28 +102,24 @@
 #define COMMAND_COOLDOWN_MS   2000   // ignore repeat commands faster than this (debounce/anti-chatter)
 
 // ---------------------------------------------------------------------------
-// ThingSpeak configuration
+// Firebase configuration
 // ---------------------------------------------------------------------------
 
 static const char *APN      = "airtelgprs.com";   // Airtel India data APN
 static const char *APN_USER = "";
 static const char *APN_PASS = "";
 
-// Channel A — device state (this firmware writes, dashboard reads)
-static const char *TS_STATE_WRITE_KEY = "EWWH8BCLUEAIKLDC";
-static const char *TS_STATE_READ_KEY  = "KA9C1ZQ82DMWEII9";
-#define TS_STATE_CHANNEL_ID 3492367UL
+// Firebase Realtime Database (no trailing slash). Same project used by the
+// dashboard -- see src/firebase.js / .env for the matching web config.
+static const char *FIREBASE_HOST = "motor-starter-4ab37-default-rtdb.firebaseio.com";
 
-// Channel B — commands (dashboard writes, this firmware reads + acks)
-static const char *TS_CMD_WRITE_KEY = "TF7MTLGD1BYMM4ST";
-static const char *TS_CMD_READ_KEY  = "8BUDOKPH8PUQ14ME";
-#define TS_CMD_CHANNEL_ID 3492368UL
+// SSL context index used for AT+CSSLCFG -- see confidence note in the file
+// header. 1 is the conventional default across the SIMCOM A76xx family.
+#define SSL_CTX_ID 1
 
-// ThingSpeak free tier: ~1 write per 15s per channel. Poll less often than
-// that so every sync cycle's writes actually land.
-#define SYNC_INTERVAL_MS      30000UL
+#define SYNC_INTERVAL_MS      20000UL
 #define GSM_CMD_TIMEOUT_MS    8000UL
-#define GSM_HTTP_TIMEOUT_MS   15000UL
+#define GSM_HTTP_TIMEOUT_MS   20000UL   // HTTPS handshakes are slower than plain HTTP
 
 // ---------------------------------------------------------------------------
 // LoRa packet protocol
@@ -253,11 +251,11 @@ void handleLoraPacket(int packetSize) {
   if (command == CMD_START) {
     lastCommandMs = now;
     startMotor();
-    if (gprsReady) writeDeviceState("lora");
+    if (gprsReady) reportLoraTriggeredCommand("ON");
   } else if (command == CMD_STOP) {
     lastCommandMs = now;
     stopMotor();
-    if (gprsReady) writeDeviceState("lora");
+    if (gprsReady) reportLoraTriggeredCommand("OFF");
   } else {
     Serial.println("[LoRa] Unrecognized command after valid prefix — ignoring");
   }
@@ -300,7 +298,7 @@ String gsmSendCommand(const String &cmd, const char *expect = "OK", unsigned lon
 }
 
 // Waits for the module's unsolicited boot banner ("RDY") after power-up.
-// SIM900A can take a couple seconds after RDY before it reliably answers
+// The module can take a couple seconds after RDY before it reliably answers
 // plain AT commands -- sending AT immediately after boot is a common cause
 // of getting silence back even though the module is otherwise fine.
 bool waitForModemReady(unsigned long timeoutMs) {
@@ -337,7 +335,7 @@ bool pingModem(int attempts = 5) {
     }
     delay(500);
   }
-  Serial.println("[GSM] Modem NOT responding to AT after retries -- check GSM_BAUD, wiring, and power supply (SIM900A needs a solid 2A+ 3.7-4.2V supply; brownouts during TX are a common cause of exactly this symptom)");
+  Serial.println("[GSM] Modem NOT responding to AT after retries -- check GSM_BAUD, wiring, and power supply (A7670C needs a solid 2A+ supply; brownouts during TX are a common cause of exactly this symptom)");
   return false;
 }
 
@@ -398,38 +396,53 @@ int gsmSignalQuality() {
   return (rssi == 99) ? -1 : rssi;
 }
 
+// A7670C PDP context activation. Uses AT+CGDCONT/AT+CGACT (the standard
+// 3GPP command set most 4G modules implement) rather than SIM900A/SIM800's
+// older AT+SAPBR "bearer" commands, which A76xx-family modules may not
+// support at all.
 bool gsmAttachGprs() {
-  Serial.print("[GSM] Attaching GPRS with APN \"");
+  Serial.print("[GSM] Setting up PDP context with APN \"");
   Serial.print(APN);
   Serial.println("\"...");
 
-  gsmSendCommand("AT+SAPBR=3,1,\"Contype\",\"GPRS\"");
-  gsmSendCommand("AT+SAPBR=3,1,\"APN\",\"" + String(APN) + "\"");
-  if (strlen(APN_USER) > 0) gsmSendCommand("AT+SAPBR=3,1,\"USER\",\"" + String(APN_USER) + "\"");
-  if (strlen(APN_PASS) > 0) gsmSendCommand("AT+SAPBR=3,1,\"PWD\",\"" + String(APN_PASS) + "\"");
+  gsmSendCommand("AT+CGDCONT=1,\"IP\",\"" + String(APN) + "\"");
 
-  Serial.println("[GSM] Opening GPRS bearer (this can take several seconds)...");
-  String openResp = gsmSendCommand("AT+SAPBR=1,1", "OK", GSM_CMD_TIMEOUT_MS * 2);
-  if (openResp.indexOf("ERROR") != -1) {
-    Serial.println("[GSM] AT+SAPBR=1,1 returned ERROR -- APN may be wrong, or no data service on this SIM");
+  Serial.println("[GSM] Activating PDP context (this can take several seconds)...");
+  String actResp = gsmSendCommand("AT+CGACT=1,1", "OK", GSM_CMD_TIMEOUT_MS * 2);
+  if (actResp.indexOf("ERROR") != -1) {
+    Serial.println("[GSM] AT+CGACT=1,1 returned ERROR -- APN may be wrong, or no data service on this SIM");
   }
 
-  String status = gsmSendCommand("AT+SAPBR=2,1", "OK");
-  bool ok = status.indexOf("+SAPBR: 1,1") != -1;
+  String status = gsmSendCommand("AT+CGACT?", "OK");
+  bool ok = status.indexOf("+CGACT: 1,1") != -1;
 
   if (ok) {
-    Serial.println("[GSM] GPRS bearer open");
+    Serial.println("[GSM] PDP context active");
   } else {
-    Serial.print("[GSM] GPRS bearer NOT open, status: ");
+    Serial.print("[GSM] PDP context NOT active, status: ");
     Serial.println(status);
   }
   return ok;
 }
 
-// Plain HTTP GET via SIM900A's AT+HTTPACTION=0 (ThingSpeak's classic API
-// works over unencrypted HTTP, so no AT+HTTPSSL is used here at all).
-bool gsmHttpGet(const String &url, String &responseOut) {
-  Serial.print("[HTTP] GET ");
+// Configures the SSL context used for HTTPS requests. See the confidence
+// note in the file header -- these AT+CSSLCFG parameters are based on the
+// general SIMCOM A76xx family and may need adjusting for your exact
+// firmware revision if HTTPS requests fail while plain network/GPRS
+// checks succeed.
+void gsmConfigureSsl() {
+  gsmSendCommand("AT+CSSLCFG=\"sslversion\"," + String(SSL_CTX_ID) + ",3");   // 3 = TLS 1.2
+  gsmSendCommand("AT+CSSLCFG=\"authmode\"," + String(SSL_CTX_ID) + ",0");     // 0 = skip server cert validation
+}
+
+// HTTP(S) request via A7670C's AT+HTTPACTION. `method` is 0 (GET) or 1
+// (POST). `extraHeader`, if non-empty, is sent via AT+HTTPPARA="USERDATA"
+// (used for Firebase's X-HTTP-Method-Override workaround since this AT
+// stack has no native PUT). `body`, if non-empty, is sent as the POST
+// payload via AT+HTTPDATA.
+bool gsmHttpRequest(int method, const String &url, const String &extraHeader, const String &body, String &responseOut) {
+  Serial.print("[HTTP] ");
+  Serial.print(method == 0 ? "GET " : "POST ");
   Serial.println(url);
 
   gsmSendCommand("AT+HTTPTERM");   // clear any stale session, ignore result
@@ -437,9 +450,35 @@ bool gsmHttpGet(const String &url, String &responseOut) {
   gsmSendCommand("AT+HTTPPARA=\"CID\",1");
   gsmSendCommand("AT+HTTPPARA=\"URL\",\"" + url + "\"");
 
-  String actionResp = gsmSendCommand("AT+HTTPACTION=0", "+HTTPACTION:", GSM_HTTP_TIMEOUT_MS);
+  bool isHttps = url.startsWith("https://");
+  if (isHttps) {
+    gsmConfigureSsl();
+    gsmSendCommand("AT+HTTPPARA=\"SSLCFG\"," + String(SSL_CTX_ID));
+  }
+
+  if (extraHeader.length() > 0) {
+    gsmSendCommand("AT+HTTPPARA=\"USERDATA\",\"" + extraHeader + "\\r\\n\"");
+  }
+
+  if (method == 1 && body.length() > 0) {
+    // AT+HTTPDATA=<len>,<timeout> replies "DOWNLOAD" to signal it's ready
+    // for the raw body bytes (not "OK" like most commands); the module
+    // sends its own "OK" once it has buffered exactly <len> bytes.
+    gsmSendCommand("AT+HTTPDATA=" + String(body.length()) + ",10000", "DOWNLOAD", GSM_CMD_TIMEOUT_MS);
+    gsmSerial.print(body);
+    unsigned long dataStart = millis();
+    String dataAck;
+    while (millis() - dataStart < GSM_CMD_TIMEOUT_MS) {
+      while (gsmSerial.available()) dataAck += (char)gsmSerial.read();
+      if (dataAck.indexOf("OK") != -1) break;
+    }
+    Serial.print("[GSM <] ");
+    Serial.println(dataAck.length() ? dataAck : "(no ack after HTTPDATA body)");
+  }
+
+  String actionResp = gsmSendCommand("AT+HTTPACTION=" + String(method), "+HTTPACTION:", GSM_HTTP_TIMEOUT_MS);
   if (actionResp.indexOf("+HTTPACTION:") == -1) {
-    Serial.println("[HTTP] No +HTTPACTION response -- request likely timed out (GPRS down, or server unreachable)");
+    Serial.println("[HTTP] No +HTTPACTION response -- request likely timed out (network down, TLS handshake failure, or server unreachable)");
     gsmSendCommand("AT+HTTPTERM");
     responseOut = "";
     return false;
@@ -454,6 +493,9 @@ bool gsmHttpGet(const String &url, String &responseOut) {
   }
   Serial.print("[HTTP] Status code: ");
   Serial.println(httpStatus);
+  if (isHttps && httpStatus != 200 && httpStatus < 100) {
+    Serial.println("[HTTP] Non-HTTP status code on an HTTPS request often means the TLS handshake itself failed -- see AT+CSSLCFG confidence note in file header");
+  }
 
   String readResp = gsmSendCommand("AT+HTTPREAD", "OK", GSM_HTTP_TIMEOUT_MS);
   responseOut = readResp;
@@ -464,95 +506,140 @@ bool gsmHttpGet(const String &url, String &responseOut) {
   if (!ok) {
     Serial.print("[HTTP] Request did not return 200 (got ");
     Serial.print(httpStatus);
-    Serial.println(") -- check API key/channel ID/URL");
+    Serial.println(") -- check Firebase URL/auth/rules");
   }
   return ok;
 }
 
+bool gsmHttpGet(const String &url, String &responseOut) {
+  return gsmHttpRequest(0, url, "", "", responseOut);
+}
+
+// POST with X-HTTP-Method-Override: PUT -- Firebase treats this exactly
+// like a real PUT (full overwrite at the given path), per Firebase's own
+// documented support for this header. This is how this firmware writes to
+// a fixed path despite the AT stack having no native PUT method.
+bool gsmHttpPutViaOverride(const String &url, const String &jsonBody, String &responseOut) {
+  return gsmHttpRequest(1, url, "X-HTTP-Method-Override: PUT", jsonBody, responseOut);
+}
+
 // ---------------------------------------------------------------------------
-// ThingSpeak sync
+// Firebase sync
 // ---------------------------------------------------------------------------
 
-// Very small hand-rolled JSON field extractor — good enough for ThingSpeak's
-// flat {"field1":"0","field2":"123.4",...} responses without pulling in a
-// full JSON library.
-float extractJsonField(const String &json, const char *key) {
-  String needle = String("\"") + key + "\":\"";
+// Very small hand-rolled JSON field extractor for Firebase's flat
+// {"desiredState":"ON","ack":false,...} responses, without pulling in a
+// full JSON library. Handles quoted strings, bare booleans, and numbers.
+String extractJsonField(const String &json, const char *key) {
+  String needle = String("\"") + key + "\":";
   int idx = json.indexOf(needle);
-  if (idx == -1) {
-    needle = String("\"") + key + "\":";   // numeric (unquoted) fallback
-    idx = json.indexOf(needle);
-    if (idx == -1) return NAN;
-  }
+  if (idx == -1) return "";
+
   int start = idx + needle.length();
+  while (start < (int)json.length() && json[start] == ' ') start++;
+
+  if (start < (int)json.length() && json[start] == '"') {
+    start++;   // skip opening quote
+    int end = json.indexOf('"', start);
+    if (end == -1) return "";
+    return json.substring(start, end);
+  }
+
   int end = start;
-  while (end < (int)json.length() && json[end] != '"' && json[end] != ',' && json[end] != '}') {
+  while (end < (int)json.length() && json[end] != ',' && json[end] != '}') {
     end++;
   }
-  return json.substring(start, end).toFloat();
+  String val = json.substring(start, end);
+  val.trim();
+  return val;
 }
 
 void writeDeviceState(const char *source) {
   float voltage = readVoltage();
   int signal = gsmSignalQuality();
-  unsigned long nowSec = millis() / 1000;   // no RTC/NTP on this board yet — relative uptime, not wall clock
+  unsigned long nowMs = millis();   // no RTC/NTP on this board yet -- device uptime, not wall clock
 
-  String url = "http://api.thingspeak.com/update?api_key=" + String(TS_STATE_WRITE_KEY) +
-               "&field1=" + String(motorState == MOTOR_ON ? 1 : 0) +
-               "&field2=" + String(voltage, 1) +
-               "&field3=" + String(signal) +
-               "&field4=" + String(nowSec);
+  String body = "{";
+  body += "\"motorStatus\":\"" + String(motorState == MOTOR_ON ? "ON" : "OFF") + "\",";
+  body += "\"voltage\":" + String(voltage, 1) + ",";
+  body += "\"gsmSignal\":" + String(signal) + ",";
+  body += "\"lastSeen\":" + String(nowMs);
+  body += "}";
 
+  String url = "https://" + String(FIREBASE_HOST) + "/device/state.json";
   String resp;
-  bool ok = gsmHttpGet(url, resp);
-  Serial.print("[TS] State write (" );
+  bool ok = gsmHttpPutViaOverride(url, body, resp);
+  Serial.print("[FB] State write (");
   Serial.print(source);
   Serial.print("): ");
   Serial.println(ok ? "sent" : "FAILED");
+
+  String historyBody = "{";
+  historyBody += "\"motorStatus\":\"" + String(motorState == MOTOR_ON ? "ON" : "OFF") + "\",";
+  historyBody += "\"voltage\":" + String(voltage, 1) + ",";
+  historyBody += "\"source\":\"" + String(source) + "\",";
+  historyBody += "\"timestamp\":" + String(nowMs);
+  historyBody += "}";
+  String historyUrl = "https://" + String(FIREBASE_HOST) + "/device/history.json";
+  String historyResp;
+  gsmHttpRequest(1, historyUrl, "", historyBody, historyResp);   // plain POST = Firebase push (new child)
 }
 
-void ackCommand(int desiredState, unsigned long issuedAt) {
-  Serial.println("[TS] Acking command on Channel B...");
-  String url = "http://api.thingspeak.com/update?api_key=" + String(TS_CMD_WRITE_KEY) +
-               "&field1=" + String(desiredState) +
-               "&field2=" + String(issuedAt) +
-               "&field3=1";
+void ackCommand() {
+  Serial.println("[FB] Acking command...");
+  String url = "https://" + String(FIREBASE_HOST) + "/device/command/ack.json";
   String resp;
-  bool ok = gsmHttpGet(url, resp);
-  Serial.println(ok ? "[TS] Ack sent" : "[TS] Ack FAILED");
+  bool ok = gsmHttpPutViaOverride(url, "true", resp);
+  Serial.println(ok ? "[FB] Ack sent" : "[FB] Ack FAILED");
 }
 
-void syncWithThingSpeak() {
-  Serial.println("\n[TS] ---- Sync cycle starting ----");
-  Serial.println("[TS] Reading command channel...");
+// Called after a LoRa remote triggers a start/stop directly (bypassing the
+// dashboard command queue). Writes device/command as already-applied
+// (ack=true) so the dashboard doesn't try to re-send a stale command that
+// no longer matches reality, then reports the resulting state.
+void reportLoraTriggeredCommand(const char *desiredState) {
+  String body = "{";
+  body += "\"desiredState\":\"" + String(desiredState) + "\",";
+  body += "\"source\":\"lora\",";
+  body += "\"issuedAt\":" + String(millis()) + ",";
+  body += "\"ack\":true";
+  body += "}";
 
-  String url = "http://api.thingspeak.com/channels/" + String(TS_CMD_CHANNEL_ID) +
-               "/feeds/last.json?api_key=" + String(TS_CMD_READ_KEY);
+  String url = "https://" + String(FIREBASE_HOST) + "/device/command.json";
+  String resp;
+  bool ok = gsmHttpPutViaOverride(url, body, resp);
+  Serial.println(ok ? "[FB] LoRa command reported" : "[FB] LoRa command report FAILED");
 
+  writeDeviceState("lora");
+}
+
+void syncWithFirebase() {
+  Serial.println("\n[FB] ---- Sync cycle starting ----");
+  Serial.println("[FB] Reading device/command...");
+
+  String url = "https://" + String(FIREBASE_HOST) + "/device/command.json";
   String resp;
   if (!gsmHttpGet(url, resp)) {
-    Serial.println("[TS] Failed to read command channel -- skipping this sync cycle");
+    Serial.println("[FB] Failed to read command -- skipping this sync cycle");
     return;
   }
 
-  Serial.print("[TS] Command channel response: ");
+  Serial.print("[FB] Command response: ");
   Serial.println(resp);
 
-  float desiredStateF = extractJsonField(resp, "field1");
-  float issuedAtF     = extractJsonField(resp, "field2");
-  float ackF          = extractJsonField(resp, "field3");
+  String desiredState = extractJsonField(resp, "desiredState");
+  String ackStr = extractJsonField(resp, "ack");
 
-  if (isnan(desiredStateF) || isnan(ackF)) {
-    Serial.println("[TS] Could not parse command response -- skipping this sync cycle");
+  if (desiredState.length() == 0) {
+    Serial.println("[FB] Could not parse command response -- skipping this sync cycle");
     return;
   }
 
-  bool wantOn = desiredStateF >= 1;
-  bool ack = ackF >= 1;
-  unsigned long issuedAt = isnan(issuedAtF) ? 0 : (unsigned long)issuedAtF;
+  bool wantOn = desiredState == "ON";
+  bool ack = ackStr == "true";
 
-  Serial.print("[TS] Parsed: desiredState=");
-  Serial.print(wantOn ? "ON" : "OFF");
+  Serial.print("[FB] Parsed: desiredState=");
+  Serial.print(desiredState);
   Serial.print(" ack=");
   Serial.print(ack ? "true" : "false");
   Serial.print(" currentMotorState=");
@@ -560,20 +647,20 @@ void syncWithThingSpeak() {
 
   bool applied = false;
   if (!ack && wantOn != (motorState == MOTOR_ON)) {
-    Serial.println(String("[TS] Applying dashboard command: ") + (wantOn ? "ON" : "OFF"));
+    Serial.println(String("[FB] Applying dashboard command: ") + (wantOn ? "ON" : "OFF"));
     if (wantOn) startMotor(); else stopMotor();
     applied = true;
   } else if (!ack) {
-    Serial.println("[TS] Command already matches current motor state -- nothing to apply, just acking");
+    Serial.println("[FB] Command already matches current motor state -- nothing to apply, just acking");
   }
 
   if (!ack) {
-    ackCommand(wantOn ? 1 : 0, issuedAt);
+    ackCommand();
   }
 
-  Serial.println("[TS] Reporting state back to Channel A...");
-  writeDeviceState(applied ? "dashboard" : "poll");
-  Serial.println("[TS] ---- Sync cycle done ----\n");
+  Serial.println("[FB] Reporting state back to Firebase...");
+  writeDeviceState(applied ? "dashboard" : "auto");
+  Serial.println("[FB] ---- Sync cycle done ----\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -625,7 +712,7 @@ void loop() {
 
   if (now - lastSyncMs >= SYNC_INTERVAL_MS) {
     lastSyncMs = now;
-    syncWithThingSpeak();
+    syncWithFirebase();
   }
 }
  
