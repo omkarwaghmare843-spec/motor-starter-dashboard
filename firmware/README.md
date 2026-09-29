@@ -69,9 +69,10 @@ START_RELAY_PIN     2
 STOP_RELAY_PIN      15
 RELAY_ACTIVE_HIGH   false
 VOLTAGE_SENSOR_PIN  34
-GSM_RX_PIN          21
-GSM_TX_PIN          22
+GSM_RX_PIN          16
+GSM_TX_PIN          17
 GSM_BAUD            115200
+CONFIG_BUTTON_PIN   22   // wired to GND, hold at power-on for SIM/carrier config mode
 ```
 
 LoRa SCK/MISO/MOSI use the ESP32's default hardware SPI pins (18/19/23). GSM
@@ -80,11 +81,43 @@ baud on ESP32).
 
 ### Firebase / GSM config
 
-Set `APN` (Airtel India: `airtelgprs.com`) and `FIREBASE_HOST` near the top
-of `motor_starter_rx.ino` to match your Firebase project (same project the
-dashboard uses — see `src/firebase.js` / `.env` in the project root). No API
-keys needed here since Firebase's REST API is reached directly by host +
-path, unlike ThingSpeak's per-channel keys.
+Set `DEFAULT_APN` (Airtel India: `airtelgprs.com`) and
+`DEFAULT_FIREBASE_HOST` near the top of `motor_starter_rx.ino` to match your
+Firebase project (same project the dashboard uses — see `src/firebase.js` /
+`.env` in the project root). No API keys needed here since Firebase's REST
+API is reached directly by host + path, unlike ThingSpeak's per-channel
+keys.
+
+Any Airtel India SIM works with the shipped defaults unchanged — `APN` and
+`OPERATOR_MCC_MNC` are carrier-level values (same for every Airtel SIM),
+not tied to one specific card.
+
+### SIM/carrier config mode (for a different carrier's SIM, e.g. Jio)
+
+A different carrier needs a different APN (and, if automatic network
+registration ever stalls, a different MCC/MNC for the manual `AT+COPS`
+fallback), so swapping to a non-Airtel SIM isn't plug-and-play by default.
+To reconfigure without reflashing:
+
+1. Hold the config button (`CONFIG_BUTTON_PIN`, GPIO22, wired to GND) down
+   while powering on the board.
+2. The firmware detects this at boot (before any GSM/LoRa init) and enters
+   config mode instead of normal operation — LoRa/relay/GSM handling is
+   fully suspended while in this mode.
+3. It starts a WiFi access point: SSID `MotorStarter-Setup`, password
+   `configure123`. Connect to it from a phone/laptop, then open
+   `http://192.168.4.1/` in a browser.
+4. Fill in the new SIM's APN, operator MCC+MNC, and (optionally) a
+   different Firebase host, and submit. The values are saved to the
+   ESP32's NVS flash (via the `Preferences` library) and the device reboots
+   automatically into normal operation using the new settings.
+5. Values persist across power cycles and firmware reflashes (NVS is
+   separate flash storage) until config mode is used again to change them.
+   With the button never pressed, behavior is unchanged from before this
+   feature existed — the hardcoded Airtel defaults are used.
+
+Common MCC+MNC values for reference: Airtel India `40490`, Jio `40570`,
+Vi/Vodafone Idea `40584`. Not exhaustive — check locally if unsure.
 
 ### LoRa protocol
 

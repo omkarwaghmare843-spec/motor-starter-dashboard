@@ -100,6 +100,28 @@
   Pin assignments below were corrected to match the actual board during
   bring-up; double check before reflashing on different hardware.
 
+  Configurable SIM/carrier settings (config mode):
+    APN and the manual-registration MCC/MNC are only correct for the SIM
+    this firmware shipped with configured for (Airtel India, by default,
+    below). A different carrier's SIM (e.g. Jio) generally needs a
+    different APN, and if automatic registration ever stalls, a different
+    MCC/MNC for the manual AT+COPS fallback -- so swapping SIMs isn't
+    plug-and-play by default.
+
+    To let a customer reconfigure this without reflashing: hold the config
+    button (CONFIG_BUTTON_PIN, wired to GND, INPUT_PULLUP) down while
+    powering on the board. setup() checks this pin once at boot, before any
+    GSM/LoRa init, and if held LOW, enters config mode instead of normal
+    operation: it starts a WiFi access point and a small web server with a
+    form for APN / operator MCC-MNC / Firebase host, saves whatever is
+    submitted into NVS (via Preferences), and reboots into normal mode.
+    Normal boot reads these three values from NVS if present, falling back
+    to the hardcoded Airtel defaults below if nothing has been configured
+    yet -- so out of the box, with the button never pressed, behavior is
+    unchanged from before this feature existed. Config mode fully suspends
+    LoRa/relay/GSM handling; it's a dedicated setup state, not a background
+    mode.
+
   Libraries required (Arduino Library Manager):
     - LoRa (Sandeep Mistry)
 */
@@ -107,6 +129,9 @@
 #include <SPI.h>
 #include <LoRa.h>
 #include <HardwareSerial.h>
+#include <Preferences.h>
+#include <WiFi.h>
+#include <WebServer.h>
 
 // ---------------------------------------------------------------------------
 // Pin configuration — CONFIRM/CORRECT these against your actual PCB wiring
@@ -133,6 +158,11 @@
 #define GSM_TX_PIN 17   // ESP32 pin that transmits to A7670C RX
 #define GSM_BAUD   115200   // must match the module's configured UART baud
 
+// Config-mode entry button — wired to GND, INPUT_PULLUP (pressed = LOW).
+// Hold down while powering on to enter SIM/carrier config mode. Free GPIO
+// (not used by LoRa/relays/voltage-sense/GSM UART).
+#define CONFIG_BUTTON_PIN 22
+
 // ---------------------------------------------------------------------------
 // DOL starter timing
 // ---------------------------------------------------------------------------
@@ -144,19 +174,64 @@
 // Firebase configuration
 // ---------------------------------------------------------------------------
 
-static const char *APN      = "airtelgprs.com";   // Airtel India data APN
-static const char *APN_USER = "";
-static const char *APN_PASS = "";
+// Defaults, used until/unless config mode saves different values to NVS.
+// Do NOT change these for Airtel -- they're correct for any Airtel India
+// SIM (carrier-level values, not tied to one specific SIM card).
+#define DEFAULT_APN            "airtelgprs.com"   // Airtel India data APN
+#define DEFAULT_OPERATOR_MCC_MNC "40490"          // Airtel India
+#define DEFAULT_FIREBASE_HOST  "motor-starter-4ab37-default-rtdb.firebaseio.com"
+
+// Loaded at boot from NVS if config mode has saved a customer's own SIM
+// settings; otherwise left at the DEFAULT_* values above. Not const, since
+// loadConfig() fills these in setup().
+String APN = DEFAULT_APN;
+String APN_USER = "";
+String APN_PASS = "";
 
 // Numeric MCC/MNC for manual network registration (AT+COPS=1,2,"..."),
 // used as a fallback if automatic registration (AT+CNMP=2) stalls -- seen
 // during bring-up, where AT+CREG? stayed 0,0 despite the tower being
 // visible in an AT+COPS=? scan, and a manual force fixed it immediately.
-static const char *OPERATOR_MCC_MNC = "40490";   // Airtel India
+String OPERATOR_MCC_MNC = DEFAULT_OPERATOR_MCC_MNC;
 
 // Firebase Realtime Database (no trailing slash). Same project used by the
 // dashboard -- see src/firebase.js / .env for the matching web config.
-static const char *FIREBASE_HOST = "motor-starter-4ab37-default-rtdb.firebaseio.com";
+String FIREBASE_HOST = DEFAULT_FIREBASE_HOST;
+
+Preferences configPrefs;
+
+// Reads APN/MCC-MNC/Firebase host from NVS (namespace "motorcfg"), falling
+// back to the DEFAULT_* values above for anything never configured -- so a
+// device that has never been through config mode behaves exactly as before
+// this feature existed.
+void loadConfig() {
+  configPrefs.begin("motorcfg", true);   // read-only
+  APN = configPrefs.getString("apn", DEFAULT_APN);
+  APN_USER = configPrefs.getString("apnUser", "");
+  APN_PASS = configPrefs.getString("apnPass", "");
+  OPERATOR_MCC_MNC = configPrefs.getString("mccMnc", DEFAULT_OPERATOR_MCC_MNC);
+  FIREBASE_HOST = configPrefs.getString("fbHost", DEFAULT_FIREBASE_HOST);
+  configPrefs.end();
+
+  Serial.println("[CFG] Loaded configuration:");
+  Serial.print("[CFG]   APN=");
+  Serial.println(APN);
+  Serial.print("[CFG]   OPERATOR_MCC_MNC=");
+  Serial.println(OPERATOR_MCC_MNC);
+  Serial.print("[CFG]   FIREBASE_HOST=");
+  Serial.println(FIREBASE_HOST);
+}
+
+void saveConfig(const String &apn, const String &apnUser, const String &apnPass,
+                const String &mccMnc, const String &fbHost) {
+  configPrefs.begin("motorcfg", false);   // read-write
+  if (apn.length() > 0) configPrefs.putString("apn", apn);
+  configPrefs.putString("apnUser", apnUser);
+  configPrefs.putString("apnPass", apnPass);
+  if (mccMnc.length() > 0) configPrefs.putString("mccMnc", mccMnc);
+  if (fbHost.length() > 0) configPrefs.putString("fbHost", fbHost);
+  configPrefs.end();
+}
 
 // SSL context index used for AT+CSSLCFG -- see confidence note in the file
 // header. 1 is the conventional default across the SIMCOM A76xx family.
@@ -903,6 +978,98 @@ void syncWithFirebase() {
 }
 
 // ---------------------------------------------------------------------------
+// Config mode — WiFi AP + web form for SIM/carrier settings
+// ---------------------------------------------------------------------------
+
+static const char *CONFIG_AP_SSID = "MotorStarter-Setup";
+static const char *CONFIG_AP_PASSWORD = "configure123";   // WPA2, 8+ chars required
+
+WebServer configServer(80);
+
+const char *CONFIG_PAGE_HTML =
+  "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
+  "<title>Motor Starter Setup</title>"
+  "<style>body{font-family:sans-serif;max-width:420px;margin:24px auto;padding:0 16px}"
+  "label{display:block;margin-top:12px;font-weight:bold}"
+  "input{width:100%;padding:8px;box-sizing:border-box;font-size:16px}"
+  "button{margin-top:20px;padding:10px 20px;font-size:16px}</style></head><body>"
+  "<h2>Motor Starter — SIM/Carrier Setup</h2>"
+  "<form method='POST' action='/save'>"
+  "<label>APN</label><input name='apn' value='%APN%' required>"
+  "<label>APN Username (optional)</label><input name='apnUser' value='%APNUSER%'>"
+  "<label>APN Password (optional)</label><input name='apnPass' value='%APNPASS%'>"
+  "<label>Operator MCC+MNC (e.g. 40490 for Airtel India, 40570 for Jio)</label>"
+  "<input name='mccMnc' value='%MCCMNC%' required>"
+  "<label>Firebase Realtime Database host (no https://, no trailing slash)</label>"
+  "<input name='fbHost' value='%FBHOST%' required>"
+  "<button type='submit'>Save &amp; Reboot</button>"
+  "</form></body></html>";
+
+String buildConfigPage() {
+  String page = CONFIG_PAGE_HTML;
+  page.replace("%APN%", APN);
+  page.replace("%APNUSER%", APN_USER);
+  page.replace("%APNPASS%", APN_PASS);
+  page.replace("%MCCMNC%", OPERATOR_MCC_MNC);
+  page.replace("%FBHOST%", FIREBASE_HOST);
+  return page;
+}
+
+void handleConfigRoot() {
+  configServer.send(200, "text/html", buildConfigPage());
+}
+
+void handleConfigSave() {
+  String apn = configServer.arg("apn");
+  String apnUser = configServer.arg("apnUser");
+  String apnPass = configServer.arg("apnPass");
+  String mccMnc = configServer.arg("mccMnc");
+  String fbHost = configServer.arg("fbHost");
+
+  saveConfig(apn, apnUser, apnPass, mccMnc, fbHost);
+
+  configServer.send(200, "text/html",
+    "<!DOCTYPE html><html><body style='font-family:sans-serif;max-width:420px;margin:24px auto;padding:0 16px'>"
+    "<h2>Saved</h2><p>Configuration saved. The device is rebooting into normal operation now.</p>"
+    "</body></html>");
+
+  Serial.println("[CFG] Configuration saved via web form -- rebooting into normal mode");
+  delay(500);   // let the response flush before restarting
+  ESP.restart();
+}
+
+// Enters config mode: starts a WiFi AP + web server for SIM/carrier setup
+// and never returns (loops forever handling web requests) until the device
+// is rebooted, either by the save handler or a manual power cycle. Called
+// from setup() only when CONFIG_BUTTON_PIN is held LOW at boot -- normal
+// LoRa/relay/GSM operation is fully suspended in this mode.
+void enterConfigMode() {
+  Serial.println("[CFG] Config button held at boot -- entering config mode");
+  Serial.println("[CFG] Normal operation (LoRa/relay/GSM) is suspended while in this mode");
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(CONFIG_AP_SSID, CONFIG_AP_PASSWORD);
+  IPAddress ip = WiFi.softAPIP();
+
+  Serial.print("[CFG] AP started: SSID=\"");
+  Serial.print(CONFIG_AP_SSID);
+  Serial.print("\" password=\"");
+  Serial.print(CONFIG_AP_PASSWORD);
+  Serial.println("\"");
+  Serial.print("[CFG] Connect to that WiFi network, then open http://");
+  Serial.print(ip);
+  Serial.println("/ in a browser to configure");
+
+  configServer.on("/", HTTP_GET, handleConfigRoot);
+  configServer.on("/save", HTTP_POST, handleConfigSave);
+  configServer.begin();
+
+  while (true) {
+    configServer.handleClient();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Setup / loop
 // ---------------------------------------------------------------------------
 
@@ -910,6 +1077,14 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println("\n[BOOT] Motor Starter RX firmware starting...");
+
+  pinMode(CONFIG_BUTTON_PIN, INPUT_PULLUP);
+
+  loadConfig();
+
+  if (digitalRead(CONFIG_BUTTON_PIN) == LOW) {
+    enterConfigMode();   // never returns
+  }
 
   pinMode(START_RELAY_PIN, OUTPUT);
   pinMode(STOP_RELAY_PIN, OUTPUT);
