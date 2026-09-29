@@ -31,14 +31,16 @@ function sourceLabel(source) {
 }
 
 export default function App() {
-  const { state, command, loading, isOnline, sendCommand } = useDevice()
+  const { state, loading, isOnline, sendCommand } = useDevice()
   const history = useHistory(50)
   const [sending, setSending] = useState(false)
 
   const motorStatus = state?.motorStatus ?? 'UNKNOWN'
   const isOn = motorStatus === 'ON'
-  const pendingCommand = command && command.desiredState !== motorStatus && !command.ack
 
+  // Fire-and-forget, same as the LoRa remote: send the command and don't
+  // wait for the device to ack it. The device's own periodic sync will
+  // eventually update state.motorStatus once it applies the command.
   const handleToggle = async () => {
     setSending(true)
     try {
@@ -85,17 +87,11 @@ export default function App() {
             <button
               className={`toggle-btn ${isOn ? 'btn-stop' : 'btn-start'}`}
               onClick={handleToggle}
-              disabled={sending || pendingCommand}
+              disabled={sending}
             >
               <PowerIcon width={18} height={18} />
-              {sending || pendingCommand ? 'Sending command…' : isOn ? 'Stop Motor' : 'Start Motor'}
+              {sending ? 'Sending command…' : isOn ? 'Stop Motor' : 'Start Motor'}
             </button>
-
-            {pendingCommand && (
-              <p className="hint hint-pending">
-                Waiting for device to apply <strong>{command.desiredState}</strong>…
-              </p>
-            )}
 
             <div className="meta-row">
               <ClockIcon width={14} height={14} />

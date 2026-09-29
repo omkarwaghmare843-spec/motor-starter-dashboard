@@ -6,24 +6,18 @@ const OFFLINE_THRESHOLD_MS = 3 * 60 * 1000 // GSM polling is slow; 3 min of sile
 
 export function useDevice() {
   const [state, setState] = useState(null)
-  const [command, setCommand] = useState(null)
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
     const stateRef = ref(db, 'device/state')
-    const commandRef = ref(db, 'device/command')
 
     const unsubState = onValue(stateRef, (snap) => {
       setState(snap.val())
       setLoading(false)
     })
-    const unsubCommand = onValue(commandRef, (snap) => {
-      setCommand(snap.val())
-    })
 
     return () => {
       unsubState()
-      unsubCommand()
     }
   }, [])
 
@@ -31,6 +25,9 @@ export function useDevice() {
     ? Date.now() - state.lastSeen < OFFLINE_THRESHOLD_MS
     : false
 
+  // Fire-and-forget, same as the LoRa remote: write the command and don't
+  // wait for/track an ack. The device applies it on its next sync cycle
+  // and reports the result back via device/state.
   const sendCommand = async (desiredState) => {
     await update(ref(db, 'device/command'), {
       desiredState,
@@ -40,5 +37,5 @@ export function useDevice() {
     })
   }
 
-  return { state, command, loading, isOnline, sendCommand }
+  return { state, loading, isOnline, sendCommand }
 }
