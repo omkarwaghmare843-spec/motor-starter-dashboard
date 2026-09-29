@@ -108,8 +108,8 @@
 #define VOLTAGE_SCALE      110.0   // calibrate: real_voltage = adc_volts * VOLTAGE_SCALE
 
 // A7670C 4G/LTE module (hardware UART2) — confirm these against your actual wiring
-#define GSM_RX_PIN 22   // ESP32 pin that receives from A7670C TX
-#define GSM_TX_PIN 21   // ESP32 pin that transmits to A7670C RX
+#define GSM_RX_PIN 16   // ESP32 pin that receives from A7670C TX
+#define GSM_TX_PIN 17   // ESP32 pin that transmits to A7670C RX
 #define GSM_BAUD   115200   // must match the module's configured UART baud
 
 // ---------------------------------------------------------------------------
@@ -436,6 +436,100 @@ bool gsmAttachGprs() {
   return ok;
 }
 
+// Days since 1970-01-01 for a UTC proleptic-Gregorian date, via Howard
+// Hinnant's well-known "days_from_civil" algorithm -- correct across leap
+// years (including century years like 2000) without a lookup table.
+// Avoids relying on ESP32 Arduino core's mktime()/timegm(), which depend on
+// TZ environment state and aren't guaranteed reliably available/correct
+// across core versions for a plain UTC epoch conversion.
+static int32_t daysFromCivil(int year, int month, int day) {
+  int y = year;
+  if (month <= 2) y -= 1;
+  int era = (y >= 0 ? y : y - 399) / 400;
+  unsigned yoe = (unsigned)(y - era * 400);
+  unsigned doy = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;
+  unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + (int32_t)doe - 719468;
+}
+
+// Global wall-clock reference, established once via NTP: unixMsAtSync is
+// the real epoch time (ms) at the moment millis() read msAtSync. Later
+// wall-clock time is unixMsAtSync + (millis() - msAtSync) -- the standard
+// pattern for tracking real time on a device with no RTC.
+int64_t unixMsAtSync = 0;
+unsigned long msAtSync = 0;
+bool timeSynced = false;
+
+int64_t currentUnixMs() {
+  if (!timeSynced) return 0;
+  return unixMsAtSync + (int64_t)(millis() - msAtSync);
+}
+
+// Arduino's String() has no int64_t/long long overload (ESP32's `long` is
+// only 32-bit, too small for a Unix ms timestamp) -- format manually.
+String int64ToString(int64_t value) {
+  if (value == 0) return "0";
+  bool negative = value < 0;
+  uint64_t v = negative ? (uint64_t)(-value) : (uint64_t)value;
+  char buf[21];   // max int64 digits (19) + sign + null
+  int i = 20;
+  buf[i] = '\0';
+  while (v > 0) {
+    buf[--i] = '0' + (v % 10);
+    v /= 10;
+  }
+  if (negative) buf[--i] = '-';
+  return String(&buf[i]);
+}
+
+// Syncs the module's clock to a real NTP server (UTC, no timezone offset
+// -- this firmware only needs a correct epoch value, not local time) over
+// the already-active PDP context, then reads it back via AT+CCLK? and
+// converts to a Unix ms timestamp for use as lastSeen/timestamp fields.
+bool gsmSyncTime() {
+  Serial.println("[GSM] Syncing time via NTP...");
+  gsmSendCommand("AT+CNTP=\"pool.ntp.org\",0");
+  gsmSendCommand("AT+CNTP", "+CNTP:", GSM_CMD_TIMEOUT_MS * 2);
+
+  String clk = gsmSendCommand("AT+CCLK?", "OK", 5000);
+  int idx = clk.indexOf("+CCLK: \"");
+  if (idx == -1) {
+    Serial.println("[GSM] Could not read AT+CCLK? -- time sync failed");
+    return false;
+  }
+  int start = idx + 8;   // length of "+CCLK: \""
+  // Expected: yy/MM/dd,hh:mm:ss+zz
+  if (clk.length() < (unsigned)(start + 17)) {
+    Serial.println("[GSM] AT+CCLK? response too short to parse -- time sync failed");
+    return false;
+  }
+  int yy = clk.substring(start, start + 2).toInt();
+  int month = clk.substring(start + 3, start + 5).toInt();
+  int day = clk.substring(start + 6, start + 8).toInt();
+  int hh = clk.substring(start + 9, start + 11).toInt();
+  int mi = clk.substring(start + 12, start + 14).toInt();
+  int ss = clk.substring(start + 15, start + 17).toInt();
+
+  if (yy <= 0 || yy >= 100 || month < 1 || month > 12 || day < 1 || day > 31) {
+    Serial.println("[GSM] AT+CCLK? returned an unsynced/placeholder clock -- time sync failed");
+    return false;
+  }
+
+  int32_t days = daysFromCivil(2000 + yy, month, day);
+  int64_t utcSeconds = (int64_t)days * 86400LL + hh * 3600LL + mi * 60LL + ss;
+
+  unixMsAtSync = utcSeconds * 1000LL;
+  msAtSync = millis();
+  timeSynced = true;
+
+  Serial.print("[GSM] Time synced: 20");
+  Serial.print(clk.substring(start, start + 17));
+  Serial.print(" UTC (unix ms: ");
+  Serial.print((long)(unixMsAtSync / 1000));
+  Serial.println("...)");
+  return true;
+}
+
 // Configures the SSL context used for HTTPS requests. See the confidence
 // note in the file header -- these AT+CSSLCFG parameters are based on the
 // general SIMCOM A76xx family and may need adjusting for your exact
@@ -468,7 +562,14 @@ bool gsmHttpRequest(int method, const String &url, const String &extraHeader, co
   }
 
   if (extraHeader.length() > 0) {
-    gsmSendCommand("AT+HTTPPARA=\"USERDATA\",\"" + extraHeader + "\\r\\n\"");
+    // Real CR/LF bytes (0x0D 0x0A), not the 4-char literal text "\r\n" --
+    // A7670C's HTTP-A stack uses the actual CRLF to delimit/terminate the
+    // custom header line inside USERDATA, same as writing a raw header
+    // line by hand. A single backslash here is a real C++ escape; using
+    // "\\r\\n" (double-escaped) sends the literal text \r\n as 4 garbage
+    // characters instead, which is why the override silently had no effect
+    // even though the AT command itself returned OK.
+    gsmSendCommand("AT+HTTPPARA=\"USERDATA\",\"" + extraHeader + "\r\n\"");
   }
 
   if (method == 1 && body.length() > 0) {
@@ -581,13 +682,23 @@ String extractJsonField(const String &json, const char *key) {
 void writeDeviceState(const char *source) {
   float voltage = readVoltage();
   int signal = gsmSignalQuality();
-  unsigned long nowMs = millis();   // no RTC/NTP on this board yet -- device uptime, not wall clock
+
+  int64_t nowMs = currentUnixMs();
+  if (nowMs == 0) {
+    // Time never successfully synced (e.g. NTP failed at boot) -- fall
+    // back to device uptime so lastSeen still moves forward, though the
+    // dashboard's offline check (which compares against Date.now()) will
+    // incorrectly read this device as offline until a sync succeeds.
+    Serial.println("[FB] Warning: time not synced, using device uptime for lastSeen/timestamp");
+    nowMs = (int64_t)millis();
+  }
+  String nowMsStr = int64ToString(nowMs);
 
   String body = "{";
   body += "\"motorStatus\":\"" + String(motorState == MOTOR_ON ? "ON" : "OFF") + "\",";
   body += "\"voltage\":" + String(voltage, 1) + ",";
   body += "\"gsmSignal\":" + String(signal) + ",";
-  body += "\"lastSeen\":" + String(nowMs);
+  body += "\"lastSeen\":" + nowMsStr;
   body += "}";
 
   String url = "https://" + String(FIREBASE_HOST) + "/device/state.json";
@@ -602,7 +713,7 @@ void writeDeviceState(const char *source) {
   historyBody += "\"motorStatus\":\"" + String(motorState == MOTOR_ON ? "ON" : "OFF") + "\",";
   historyBody += "\"voltage\":" + String(voltage, 1) + ",";
   historyBody += "\"source\":\"" + String(source) + "\",";
-  historyBody += "\"timestamp\":" + String(nowMs);
+  historyBody += "\"timestamp\":" + nowMsStr;
   historyBody += "}";
   String historyUrl = "https://" + String(FIREBASE_HOST) + "/device/history.json";
   String historyResp;
@@ -622,10 +733,13 @@ void ackCommand() {
 // (ack=true) so the dashboard doesn't try to re-send a stale command that
 // no longer matches reality, then reports the resulting state.
 void reportLoraTriggeredCommand(const char *desiredState) {
+  int64_t nowMs = currentUnixMs();
+  if (nowMs == 0) nowMs = (int64_t)millis();   // time not synced yet -- see writeDeviceState note
+
   String body = "{";
   body += "\"desiredState\":\"" + String(desiredState) + "\",";
   body += "\"source\":\"lora\",";
-  body += "\"issuedAt\":" + String(millis()) + ",";
+  body += "\"issuedAt\":" + int64ToString(nowMs) + ",";
   body += "\"ack\":true";
   body += "}";
 
@@ -709,6 +823,8 @@ void setup() {
   gprsReady = gsmInitModem() && gsmAttachGprs();
   if (!gprsReady) {
     Serial.println("[BOOT] GPRS not ready yet — will keep retrying in main loop");
+  } else if (!gsmSyncTime()) {
+    Serial.println("[BOOT] Time sync failed -- lastSeen/timestamp will use device uptime until a later sync succeeds");
   }
   lastSyncMs = millis() - SYNC_INTERVAL_MS;   // force an immediate first sync
 }
@@ -730,8 +846,13 @@ void loop() {
 
   if (!gprsReady) {
     gprsReady = gsmInitModem() && gsmAttachGprs();
+    if (gprsReady && !timeSynced) gsmSyncTime();
     delay(2000);
     return;
+  }
+
+  if (!timeSynced) {
+    gsmSyncTime();   // retry until it succeeds -- lastSeen is wrong until then
   }
 
   if (now - lastSyncMs >= SYNC_INTERVAL_MS) {
