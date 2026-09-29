@@ -34,25 +34,29 @@
     which is why the project moved to ThingSpeak (HTTP-only) for a while.
 
     A7670C is a genuine 4G/LTE module with a real TLS stack (AT+CSSLCFG),
-    which solves the HTTPS problem. It still only exposes GET/POST/HEAD at
-    the AT+HTTPACTION layer (no native PUT) -- but Firebase's REST API
-    officially documents honoring an X-HTTP-Method-Override header on a
-    POST to achieve PUT (overwrite) semantics:
-    https://firebase.google.com/docs/database/rest/save-data
-    ("If we are making REST calls from a browser that does not support
-    some of the above methods, Firebase supports the X-HTTP-Method-Override
-    header.") So writes here are POST + that header, not a native PUT.
+    which solves the HTTPS problem. Textbook SIMCOM documentation says
+    AT+HTTPACTION only supports GET(0)/POST(1)/HEAD(2), which would have
+    meant no native PUT -- Firebase's X-HTTP-Method-Override header (which
+    Firebase's own docs confirm it honors) was tried as a workaround, in
+    both a literal-text and a real-CRLF-bytes form, and BOTH failed on
+    real hardware (accepted-but-ineffective, and outright AT-parser
+    ERROR, respectively) -- and a live test also showed Firebase's RTDB
+    REST API does not honor a query-string override either. None of that
+    matters now: `AT+HTTPACTION=?` on this actual module/firmware reports
+    a 0-5 range, not 0-2, and live testing confirmed method 4 is a real,
+    working PUT (response echoes the sent JSON) and method 3 is DELETE
+    (response is the literal text "null") -- both verified directly
+    against Firebase, not assumed from documentation. Writes now use
+    AT+HTTPACTION=4 directly; no header tricks needed at all.
 
     CONFIDENCE NOTE: the exact AT+CSSLCFG parameter values below (SSL
     context index, TLS version code, and whether HTTPS is enabled via
-    AT+HTTPPARA="SSLCFG",<ctxid> vs a separate flag) are based on the
-    general SIMCOM A76xx/SIM7600 AT command family and have NOT been
-    verified against A7670C's own AT command manual for your specific
-    firmware revision. If AT+HTTPACTION fails specifically on HTTPS
-    requests, check SIMCOM's "A76XX Series_HTTP(S)_Application Note" PDF
-    for your module's firmware version -- this is the authoritative
-    reference with a worked example, and command details are known to
-    drift between SIMCOM firmware releases.
+    AT+HTTPPARA="SSLCFG",<ctxid> vs a separate flag) are confirmed working
+    on this specific module via live testing (TLS handshake succeeds,
+    correct HTTP status codes returned) -- but the exact wording/param
+    names could still differ on a different firmware revision. Methods 2
+    and 5 in AT+HTTPACTION's reported range were not identified/tested;
+    avoid relying on them without verifying the same way methods 3/4 were.
 
   Firebase Realtime Database schema (device/state, device/command,
   device/history) -- see the main README.md for the full schema and
@@ -554,14 +558,28 @@ void gsmConfigureSsl() {
   gsmSendCommand("AT+CSSLCFG=\"authmode\"," + String(SSL_CTX_ID) + ",0");     // 0 = skip server cert validation
 }
 
-// HTTP(S) request via A7670C's AT+HTTPACTION. `method` is 0 (GET) or 1
-// (POST). `extraHeader`, if non-empty, is sent via AT+HTTPPARA="USERDATA"
-// (used for Firebase's X-HTTP-Method-Override workaround since this AT
-// stack has no native PUT). `body`, if non-empty, is sent as the POST
-// payload via AT+HTTPDATA.
-bool gsmHttpRequest(int method, const String &url, const String &extraHeader, const String &body, String &responseOut) {
+// HTTP(S) request via A7670C's AT+HTTPACTION. Confirmed by live testing
+// against this exact module/firmware (AT+HTTPACTION=? reports a 0-5 range,
+// wider than the textbook SIMCOM GET/POST/HEAD trio):
+//   0 = GET
+//   1 = POST   (Firebase: push, creates a new child with a random key)
+//   3 = DELETE (Firebase: removes the path; response body is the literal
+//               text "null", matching Firebase's documented DELETE response)
+//   4 = PUT    (Firebase: real overwrite; response body echoes back the
+//               exact JSON that was sent -- this is what device/state and
+//               device/command now use instead of the abandoned
+//               X-HTTP-Method-Override header approach, which turned out
+//               not to work on this module in either form tried, and
+//               which a live test also showed Firebase's RTDB REST API
+//               does not honor via header OR query-string override)
+// Methods 2 and 5 were not identified/tested -- avoid relying on them.
+// `body`, if non-empty, is sent as the request payload via AT+HTTPDATA
+// (used for POST and PUT; GET/DELETE pass an empty body).
+bool gsmHttpRequest(int method, const String &url, const String &body, String &responseOut) {
+  static const char *methodNames[] = { "GET", "POST", "HEAD", "DELETE", "PUT", "?" };
   Serial.print("[HTTP] ");
-  Serial.print(method == 0 ? "GET " : "POST ");
+  Serial.print(methodNames[method >= 0 && method <= 5 ? method : 5]);
+  Serial.print(" ");
   Serial.println(url);
 
   gsmSendCommand("AT+HTTPTERM");   // clear any stale session, ignore result
@@ -575,22 +593,7 @@ bool gsmHttpRequest(int method, const String &url, const String &extraHeader, co
     gsmSendCommand("AT+HTTPPARA=\"SSLCFG\"," + String(SSL_CTX_ID));
   }
 
-  if (extraHeader.length() > 0) {
-    // DISABLED for now: neither the literal 4-char text "\r\n" nor real
-    // embedded CR/LF bytes work here -- the literal text is accepted (OK)
-    // but has no effect on the actual outgoing header (Firebase still
-    // responds as if it were a plain POST); real CR/LF bytes get ERROR
-    // outright, because this module's AT line parser terminates the whole
-    // command at the first bare CR it sees, even inside a quoted string
-    // (confirmed on real hardware -- both approaches tried and logged).
-    // Every write is currently landing as a Firebase push (new child),
-    // NOT an overwrite, until this is resolved. See firmware/README.md for
-    // the empirical AT+HTTPACTION=?/AT+HTTPPARA=? investigation in
-    // progress to find a working method-override path on this module.
-    Serial.println("[HTTP] NOTE: X-HTTP-Method-Override header is currently disabled (doesn't work on this module/firmware) -- this write will land as a Firebase push, not an overwrite");
-  }
-
-  if (method == 1 && body.length() > 0) {
+  if ((method == 1 || method == 4) && body.length() > 0) {
     // AT+HTTPDATA=<len>,<timeout> replies "DOWNLOAD" to signal it's ready
     // for the raw body bytes (not "OK" like most commands); the module
     // sends its own "OK" once it has buffered exactly <len> bytes.
@@ -655,15 +658,19 @@ bool gsmHttpRequest(int method, const String &url, const String &extraHeader, co
 }
 
 bool gsmHttpGet(const String &url, String &responseOut) {
-  return gsmHttpRequest(0, url, "", "", responseOut);
+  return gsmHttpRequest(0, url, "", responseOut);
 }
 
-// POST with X-HTTP-Method-Override: PUT -- Firebase treats this exactly
-// like a real PUT (full overwrite at the given path), per Firebase's own
-// documented support for this header. This is how this firmware writes to
-// a fixed path despite the AT stack having no native PUT method.
-bool gsmHttpPutViaOverride(const String &url, const String &jsonBody, String &responseOut) {
-  return gsmHttpRequest(1, url, "X-HTTP-Method-Override: PUT", jsonBody, responseOut);
+// Real PUT (method 4) -- full overwrite at the given path. Confirmed by
+// live testing against this exact module/firmware: the response body
+// echoes back the sent JSON, matching Firebase's documented PUT response
+// (as opposed to POST's {"name": "-pushId"} or DELETE's "null").
+bool gsmHttpPut(const String &url, const String &jsonBody, String &responseOut) {
+  return gsmHttpRequest(4, url, jsonBody, responseOut);
+}
+
+bool gsmHttpPost(const String &url, const String &jsonBody, String &responseOut) {
+  return gsmHttpRequest(1, url, jsonBody, responseOut);
 }
 
 // ---------------------------------------------------------------------------
@@ -721,7 +728,7 @@ void writeDeviceState(const char *source) {
 
   String url = "https://" + String(FIREBASE_HOST) + "/device/state.json";
   String resp;
-  bool ok = gsmHttpPutViaOverride(url, body, resp);
+  bool ok = gsmHttpPut(url, body, resp);
   Serial.print("[FB] State write (");
   Serial.print(source);
   Serial.print("): ");
@@ -735,14 +742,14 @@ void writeDeviceState(const char *source) {
   historyBody += "}";
   String historyUrl = "https://" + String(FIREBASE_HOST) + "/device/history.json";
   String historyResp;
-  gsmHttpRequest(1, historyUrl, "", historyBody, historyResp);   // plain POST = Firebase push (new child)
+  gsmHttpPost(historyUrl, historyBody, historyResp);   // push (new child) -- history is meant to accumulate
 }
 
 void ackCommand() {
   Serial.println("[FB] Acking command...");
   String url = "https://" + String(FIREBASE_HOST) + "/device/command/ack.json";
   String resp;
-  bool ok = gsmHttpPutViaOverride(url, "true", resp);
+  bool ok = gsmHttpPut(url, "true", resp);
   Serial.println(ok ? "[FB] Ack sent" : "[FB] Ack FAILED");
 }
 
@@ -763,7 +770,7 @@ void reportLoraTriggeredCommand(const char *desiredState) {
 
   String url = "https://" + String(FIREBASE_HOST) + "/device/command.json";
   String resp;
-  bool ok = gsmHttpPutViaOverride(url, body, resp);
+  bool ok = gsmHttpPut(url, body, resp);
   Serial.println(ok ? "[FB] LoRa command reported" : "[FB] LoRa command report FAILED");
 
   writeDeviceState("lora");
