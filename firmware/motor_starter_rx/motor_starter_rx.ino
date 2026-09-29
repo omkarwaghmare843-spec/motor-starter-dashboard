@@ -161,7 +161,7 @@
 // Config-mode entry button — wired to GND, INPUT_PULLUP (pressed = LOW).
 // Hold down while powering on to enter SIM/carrier config mode. Free GPIO
 // (not used by LoRa/relays/voltage-sense/GSM UART).
-#define CONFIG_BUTTON_PIN 22
+#define CONFIG_BUTTON_PIN 21
 
 // ---------------------------------------------------------------------------
 // DOL starter timing
@@ -1077,6 +1077,8 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println("\n[BOOT] Motor Starter RX firmware starting...");
+  Serial.print("[BOOT] Free heap at boot: ");
+  Serial.println(ESP.getFreeHeap());
 
   pinMode(CONFIG_BUTTON_PIN, INPUT_PULLUP);
 
@@ -1095,7 +1097,10 @@ void setup() {
 
   setupLora();
 
+  Serial.print("[BOOT] Free heap before gsmSerial.begin(): ");
+  Serial.println(ESP.getFreeHeap());
   gsmSerial.begin(GSM_BAUD, SERIAL_8N1, GSM_RX_PIN, GSM_TX_PIN);
+  Serial.println("[BOOT] gsmSerial.begin() returned");
   gprsReady = gsmInitModem() && gsmAttachGprs();
   if (!gprsReady) {
     Serial.println("[BOOT] GPRS not ready yet — will keep retrying in main loop");
