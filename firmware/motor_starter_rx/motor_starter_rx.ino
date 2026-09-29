@@ -58,6 +58,24 @@
   device/history) -- see the main README.md for the full schema and
   firmware contract; unchanged from the original Firebase design.
 
+  Boot/registration behavior confirmed during bring-up:
+    - Unlike SIM900A, A7670C doesn't need an explicit wait for a single
+      boot banner string before it reliably answers AT -- it emits several
+      startup URCs (RDY, +CPIN, *ATREADY, SIM Toolkit menu fetches, etc.)
+      as a burst rather than one clean banner, so this firmware pings AT
+      directly instead of watching for RDY.
+    - Automatic network registration (AT+CNMP=2) can stall even when the
+      operator's tower is visible in an AT+COPS=? scan (seen as
+      AT+CREG? staying "0,0" indefinitely) -- forcing manual registration
+      via AT+COPS=1,2,"<mcc><mnc>" resolved this immediately during
+      testing. This firmware tries automatic first and falls back to a
+      manual force on the configured operator if that doesn't register.
+    - A genuine no-signal condition (CSQ 99,99, CREG 0,0, antenna/power
+      confirmed fine) was resolved by a full power cycle rather than a
+      warm AT+CFUN=1,1 restart -- if registration seems permanently stuck
+      despite good antenna/power, a full power-cycle is worth trying
+      before assuming a hardware fault.
+
   Pin assignments below were corrected to match the actual board during
   bring-up; double check before reflashing on different hardware.
 
@@ -90,8 +108,8 @@
 #define VOLTAGE_SCALE      110.0   // calibrate: real_voltage = adc_volts * VOLTAGE_SCALE
 
 // A7670C 4G/LTE module (hardware UART2) — confirm these against your actual wiring
-#define GSM_RX_PIN 21   // ESP32 pin that receives from A7670C TX
-#define GSM_TX_PIN 22   // ESP32 pin that transmits to A7670C RX
+#define GSM_RX_PIN 22   // ESP32 pin that receives from A7670C TX
+#define GSM_TX_PIN 21   // ESP32 pin that transmits to A7670C RX
 #define GSM_BAUD   115200   // must match the module's configured UART baud
 
 // ---------------------------------------------------------------------------
@@ -108,6 +126,12 @@
 static const char *APN      = "airtelgprs.com";   // Airtel India data APN
 static const char *APN_USER = "";
 static const char *APN_PASS = "";
+
+// Numeric MCC/MNC for manual network registration (AT+COPS=1,2,"..."),
+// used as a fallback if automatic registration (AT+CNMP=2) stalls -- seen
+// during bring-up, where AT+CREG? stayed 0,0 despite the tower being
+// visible in an AT+COPS=? scan, and a manual force fixed it immediately.
+static const char *OPERATOR_MCC_MNC = "40490";   // Airtel India
 
 // Firebase Realtime Database (no trailing slash). Same project used by the
 // dashboard -- see src/firebase.js / .env for the matching web config.
@@ -297,31 +321,11 @@ String gsmSendCommand(const String &cmd, const char *expect = "OK", unsigned lon
   return response;
 }
 
-// Waits for the module's unsolicited boot banner ("RDY") after power-up.
-// The module can take a couple seconds after RDY before it reliably answers
-// plain AT commands -- sending AT immediately after boot is a common cause
-// of getting silence back even though the module is otherwise fine.
-bool waitForModemReady(unsigned long timeoutMs) {
-  Serial.println("[GSM] Waiting for module boot banner (RDY)...");
-  String buf;
-  unsigned long start = millis();
-  while (millis() - start < timeoutMs) {
-    while (gsmSerial.available()) {
-      char c = (char)gsmSerial.read();
-      buf += c;
-      Serial.write(c);   // echo raw boot banner as it streams in
-    }
-    if (buf.indexOf("RDY") != -1) {
-      Serial.println("\n[GSM] Boot banner seen (RDY)");
-      return true;
-    }
-  }
-  Serial.println("\n[GSM] No RDY banner seen within timeout — module may already be up, or not powered/wired correctly");
-  return false;
-}
-
-// Retries plain "AT" a few times with short gaps -- covers both the
-// just-after-RDY settling time and general link flakiness.
+// Retries plain "AT" a few times with short gaps -- covers general link
+// settling/flakiness. Unlike SIM900A, A7670C doesn't need an explicit wait
+// for an unsolicited boot banner before it reliably answers AT -- its own
+// startup URCs (RDY, +CPIN, *ATREADY, etc.) come through as a burst rather
+// than a single banner to watch for, so this just pings AT directly.
 bool pingModem(int attempts = 5) {
   for (int i = 0; i < attempts; i++) {
     Serial.print("[GSM] AT ping attempt ");
@@ -361,8 +365,6 @@ bool checkSimPresent() {
 bool gsmInitModem() {
   Serial.println("[GSM] Initializing modem...");
 
-  waitForModemReady(5000);   // don't hard-fail on this -- module might already be past boot
-
   if (!pingModem()) {
     return false;
   }
@@ -380,6 +382,15 @@ bool gsmInitModem() {
 
   String reg = gsmSendCommand("AT+CREG?", "OK");
   bool registered = reg.indexOf("+CREG: 0,1") != -1 || reg.indexOf("+CREG: 0,5") != -1;
+
+  if (!registered) {
+    Serial.println("[GSM] Not registered via automatic mode -- forcing manual registration on known operator...");
+    gsmSendCommand("AT+COPS=1,2,\"" + String(OPERATOR_MCC_MNC) + "\"", "OK", GSM_CMD_TIMEOUT_MS * 3);
+
+    reg = gsmSendCommand("AT+CREG?", "OK");
+    registered = reg.indexOf("+CREG: 0,1") != -1 || reg.indexOf("+CREG: 0,5") != -1;
+  }
+
   Serial.println(registered ? "[GSM] Registered on network" : "[GSM] Not registered on network yet (check antenna/signal/SIM activation)");
   return registered;
 }
