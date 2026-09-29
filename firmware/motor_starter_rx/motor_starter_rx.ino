@@ -510,20 +510,34 @@ bool gsmSyncTime() {
   int mi = clk.substring(start + 12, start + 14).toInt();
   int ss = clk.substring(start + 15, start + 17).toInt();
 
-  if (yy <= 0 || yy >= 100 || month < 1 || month > 12 || day < 1 || day > 31) {
-    Serial.println("[GSM] AT+CCLK? returned an unsynced/placeholder clock -- time sync failed");
+  if (yy < 0 || yy >= 100 || month < 1 || month > 12 || day < 1 || day > 31) {
+    Serial.println("[GSM] AT+CCLK? response out of range -- time sync failed");
     return false;
   }
 
-  int32_t days = daysFromCivil(2000 + yy, month, day);
+  // Standard AT+CCLK 2-digit year convention: 00-79 -> 2000-2079,
+  // 80-99 -> 1980-1999. A module that hasn't actually synced (still on
+  // its power-on default clock) commonly reads back as 1970/1980-ish or
+  // similar placeholder dates -- reject anything not plausibly "now" so a
+  // failed sync doesn't get treated as a real timestamp.
+  int year = yy < 80 ? 2000 + yy : 1900 + yy;
+  if (year < 2024) {
+    Serial.print("[GSM] AT+CCLK? returned an implausible/unsynced clock (year ");
+    Serial.print(year);
+    Serial.println(") -- time sync failed");
+    return false;
+  }
+
+  int32_t days = daysFromCivil(year, month, day);
   int64_t utcSeconds = (int64_t)days * 86400LL + hh * 3600LL + mi * 60LL + ss;
 
   unixMsAtSync = utcSeconds * 1000LL;
   msAtSync = millis();
   timeSynced = true;
 
-  Serial.print("[GSM] Time synced: 20");
-  Serial.print(clk.substring(start, start + 17));
+  Serial.print("[GSM] Time synced: ");
+  Serial.print(year);
+  Serial.print(clk.substring(start + 2, start + 17));
   Serial.print(" UTC (unix ms: ");
   Serial.print((long)(unixMsAtSync / 1000));
   Serial.println("...)");
@@ -562,14 +576,18 @@ bool gsmHttpRequest(int method, const String &url, const String &extraHeader, co
   }
 
   if (extraHeader.length() > 0) {
-    // Real CR/LF bytes (0x0D 0x0A), not the 4-char literal text "\r\n" --
-    // A7670C's HTTP-A stack uses the actual CRLF to delimit/terminate the
-    // custom header line inside USERDATA, same as writing a raw header
-    // line by hand. A single backslash here is a real C++ escape; using
-    // "\\r\\n" (double-escaped) sends the literal text \r\n as 4 garbage
-    // characters instead, which is why the override silently had no effect
-    // even though the AT command itself returned OK.
-    gsmSendCommand("AT+HTTPPARA=\"USERDATA\",\"" + extraHeader + "\r\n\"");
+    // DISABLED for now: neither the literal 4-char text "\r\n" nor real
+    // embedded CR/LF bytes work here -- the literal text is accepted (OK)
+    // but has no effect on the actual outgoing header (Firebase still
+    // responds as if it were a plain POST); real CR/LF bytes get ERROR
+    // outright, because this module's AT line parser terminates the whole
+    // command at the first bare CR it sees, even inside a quoted string
+    // (confirmed on real hardware -- both approaches tried and logged).
+    // Every write is currently landing as a Firebase push (new child),
+    // NOT an overwrite, until this is resolved. See firmware/README.md for
+    // the empirical AT+HTTPACTION=?/AT+HTTPPARA=? investigation in
+    // progress to find a working method-override path on this module.
+    Serial.println("[HTTP] NOTE: X-HTTP-Method-Override header is currently disabled (doesn't work on this module/firmware) -- this write will land as a Firebase push, not an overwrite");
   }
 
   if (method == 1 && body.length() > 0) {
