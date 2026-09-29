@@ -62,6 +62,23 @@
   device/history) -- see the main README.md for the full schema and
   firmware contract; unchanged from the original Firebase design.
 
+  LoRa reception during a GSM/Firebase transaction:
+    A full Firebase sync cycle blocks for several seconds (multiple AT
+    commands, each with multi-second timeouts) inside syncWithFirebase().
+    Since LoRa.parsePacket() was previously only polled once per loop()
+    iteration, any packet arriving during that window sat unread in the
+    SX1278 FIFO and was overwritten/lost by the next packet -- meaning LoRa
+    commands only reliably worked in the gaps between sync cycles, and were
+    dropped if sent while a sync (visible in the serial log) was in
+    progress. Fixed by polling LoRa from inside every GSM busy-wait loop
+    (pollLoraDuringWait(), called from gsmSendCommand()'s wait and the
+    AT+HTTPDATA body-ack wait). Applying the relay action is always safe to
+    do immediately even mid-transaction; the Firebase report of that
+    LoRa-triggered change is deferred (gsmBusy/loraReportPending) until the
+    current GSM transaction finishes, since starting a second AT command
+    exchange on the same UART while one is already in flight would corrupt
+    both.
+
   Boot/registration behavior confirmed during bring-up:
     - Unlike SIM900A, A7670C doesn't need an explicit wait for a single
       boot banner string before it reliably answers AT -- it emits several
@@ -175,6 +192,15 @@ HardwareSerial gsmSerial(2);   // UART2 — avoids SoftwareSerial's timing issue
 bool gprsReady = false;
 unsigned long lastSyncMs = 0;
 
+// Set when a LoRa packet is handled while GSM is busy (mid AT-command
+// transaction) -- reporting to Firebase from inside that transaction would
+// corrupt it (nested AT commands on the same UART), so the relay action is
+// applied immediately but the Firebase report is deferred until loop() sees
+// GSM is idle again.
+bool gsmBusy = false;
+bool loraReportPending = false;
+const char *pendingLoraState = "OFF";
+
 // ---------------------------------------------------------------------------
 // Relay helpers
 // ---------------------------------------------------------------------------
@@ -279,11 +305,27 @@ void handleLoraPacket(int packetSize) {
   if (command == CMD_START) {
     lastCommandMs = now;
     startMotor();
-    if (gprsReady) reportLoraTriggeredCommand("ON");
+    if (gprsReady) {
+      if (gsmBusy) {
+        Serial.println("[LoRa] GSM busy -- deferring Firebase report until current sync finishes");
+        loraReportPending = true;
+        pendingLoraState = "ON";
+      } else {
+        reportLoraTriggeredCommand("ON");
+      }
+    }
   } else if (command == CMD_STOP) {
     lastCommandMs = now;
     stopMotor();
-    if (gprsReady) reportLoraTriggeredCommand("OFF");
+    if (gprsReady) {
+      if (gsmBusy) {
+        Serial.println("[LoRa] GSM busy -- deferring Firebase report until current sync finishes");
+        loraReportPending = true;
+        pendingLoraState = "OFF";
+      } else {
+        reportLoraTriggeredCommand("OFF");
+      }
+    }
   } else {
     Serial.println("[LoRa] Unrecognized command after valid prefix — ignoring");
   }
@@ -293,6 +335,22 @@ void handleLoraPacket(int packetSize) {
 // GSM AT command helpers
 // ---------------------------------------------------------------------------
 
+// Checks for and handles one LoRa packet, if present, without blocking.
+// Safe to call from inside any GSM busy-wait loop.
+void pollLoraDuringWait() {
+  int packetSize = LoRa.parsePacket();
+  if (packetSize > 0) {
+    handleLoraPacket(packetSize);
+  }
+}
+
+// Every blocking GSM wait below also calls pollLoraDuringWait() so a
+// remote packet arriving mid-HTTP-transaction (which can block for many
+// seconds across AT+HTTPACTION/AT+HTTPDATA/etc.) still gets caught instead
+// of sitting unread in the SX1278 FIFO until it's overwritten by the next
+// packet and lost. Without this, LoRa only "worked" in the gaps between
+// sync cycles -- exactly the symptom of needing to spam the remote button
+// while a sync was in progress.
 String gsmSendCommand(const String &cmd, const char *expect = "OK", unsigned long timeoutMs = GSM_CMD_TIMEOUT_MS) {
   while (gsmSerial.available()) gsmSerial.read();   // flush stale bytes
 
@@ -311,6 +369,7 @@ String gsmSendCommand(const String &cmd, const char *expect = "OK", unsigned lon
     if (response.indexOf(expect) != -1 || response.indexOf("ERROR") != -1) {
       break;
     }
+    pollLoraDuringWait();
   }
 
   String trimmed = response;
@@ -604,6 +663,7 @@ bool gsmHttpRequest(int method, const String &url, const String &body, String &r
     while (millis() - dataStart < GSM_CMD_TIMEOUT_MS) {
       while (gsmSerial.available()) dataAck += (char)gsmSerial.read();
       if (dataAck.indexOf("OK") != -1) break;
+      pollLoraDuringWait();
     }
     Serial.print("[GSM <] ");
     Serial.println(dataAck.length() ? dataAck : "(no ack after HTTPDATA body)");
@@ -776,7 +836,7 @@ void reportLoraTriggeredCommand(const char *desiredState) {
   writeDeviceState("lora");
 }
 
-void syncWithFirebase() {
+void syncWithFirebaseInner() {
   Serial.println("\n[FB] ---- Sync cycle starting ----");
   Serial.println("[FB] Reading device/command...");
 
@@ -826,6 +886,22 @@ void syncWithFirebase() {
   Serial.println("[FB] ---- Sync cycle done ----\n");
 }
 
+// Thin wrapper ensuring gsmBusy is always cleared (even on an early return
+// inside syncWithFirebaseInner), and flushing any LoRa-triggered Firebase
+// report that got deferred while this sync cycle was in progress.
+void syncWithFirebase() {
+  gsmBusy = true;
+  syncWithFirebaseInner();
+  gsmBusy = false;
+
+  if (loraReportPending) {
+    loraReportPending = false;
+    Serial.print("[FB] Flushing deferred LoRa report: ");
+    Serial.println(pendingLoraState);
+    reportLoraTriggeredCommand(pendingLoraState);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Setup / loop
 // ---------------------------------------------------------------------------
@@ -870,14 +946,26 @@ void loop() {
   }
 
   if (!gprsReady) {
+    gsmBusy = true;
     gprsReady = gsmInitModem() && gsmAttachGprs();
     if (gprsReady && !timeSynced) gsmSyncTime();
+    gsmBusy = false;
+    if (loraReportPending && gprsReady) {
+      loraReportPending = false;
+      reportLoraTriggeredCommand(pendingLoraState);
+    }
     delay(2000);
     return;
   }
 
   if (!timeSynced) {
+    gsmBusy = true;
     gsmSyncTime();   // retry until it succeeds -- lastSeen is wrong until then
+    gsmBusy = false;
+    if (loraReportPending) {
+      loraReportPending = false;
+      reportLoraTriggeredCommand(pendingLoraState);
+    }
   }
 
   if (now - lastSyncMs >= SYNC_INTERVAL_MS) {
